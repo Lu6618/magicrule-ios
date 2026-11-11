@@ -23,6 +23,17 @@
 		00000000000000000000101D = {isa = PBXBuildFile; fileRef = 00000000000000000000101C; };
 		00000000000000000000101F = {isa = PBXBuildFile; fileRef = 00000000000000000000101E; };
 		000000000000000000001021 = {isa = PBXBuildFile; fileRef = 000000000000000000001020; };
+		000000000000000000001031 = {isa = PBXBuildFile; fileRef = 000000000000000000001030; };
+		000000000000000000001033 = {isa = PBXBuildFile; fileRef = 000000000000000000001032; };
+		000000000000000000001035 = {isa = PBXBuildFile; fileRef = 000000000000000000001034; };
+		000000000000000000001037 = {isa = PBXBuildFile; fileRef = 000000000000000000001036; };
+		000000000000000000001039 = {isa = PBXBuildFile; fileRef = 000000000000000000001038; };
+		00000000000000000000103B = {isa = PBXBuildFile; fileRef = 00000000000000000000103A; };
+		00000000000000000000103D = {isa = PBXBuildFile; fileRef = 00000000000000000000103C; };
+		00000000000000000000103F = {isa = PBXBuildFile; fileRef = 00000000000000000000103E; };
+		000000000000000000001041 = {isa = PBXBuildFile; fileRef = 000000000000000000001040; };
+		000000000000000000001043 = {isa = PBXBuildFile; fileRef = 000000000000000000001042; };
+		000000000000000000001045 = {isa = PBXBuildFile; fileRef = 000000000000000000001044; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -43,6 +54,17 @@
 		00000000000000000000101C = {isa = PBXFileReference; lastKnownFileType = text.json; path = Surfboard.json; sourceTree = "<group>"; };
 		00000000000000000000101E = {isa = PBXFileReference; lastKnownFileType = text.json; path = Surge.json; sourceTree = "<group>"; };
 		000000000000000000001020 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		000000000000000000001030 = {isa = PBXFileReference; lastKnownFileType = image.png; path = AdGuard.png; sourceTree = "<group>"; };
+		000000000000000000001032 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Anywhere.png; sourceTree = "<group>"; };
+		000000000000000000001034 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Egern.png; sourceTree = "<group>"; };
+		000000000000000000001036 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Loon.png; sourceTree = "<group>"; };
+		000000000000000000001038 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Mihomo.png; sourceTree = "<group>"; };
+		00000000000000000000103A = {isa = PBXFileReference; lastKnownFileType = image.png; path = QuantumultX.png; sourceTree = "<group>"; };
+		00000000000000000000103C = {isa = PBXFileReference; lastKnownFileType = image.png; path = Shadowrocket.png; sourceTree = "<group>"; };
+		00000000000000000000103E = {isa = PBXFileReference; lastKnownFileType = image.png; path = SingBox.png; sourceTree = "<group>"; };
+		000000000000000000001040 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Stash.png; sourceTree = "<group>"; };
+		000000000000000000001042 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Surfboard.png; sourceTree = "<group>"; };
+		000000000000000000001044 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Surge.png; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -83,6 +105,17 @@
 				00000000000000000000101C,
 				00000000000000000000101E,
 				000000000000000000001020,
+				000000000000000000001030,
+				000000000000000000001032,
+				000000000000000000001034,
+				000000000000000000001036,
+				000000000000000000001038,
+				00000000000000000000103A,
+				00000000000000000000103C,
+				00000000000000000000103E,
+				000000000000000000001040,
+				000000000000000000001042,
+				000000000000000000001044,
 			);
 			path = MagicRule;
 			sourceTree = "<group>";
@@ -165,6 +198,17 @@
 				00000000000000000000101D,
 				00000000000000000000101F,
 				000000000000000000001021,
+				000000000000000000001031,
+				000000000000000000001033,
+				000000000000000000001035,
+				000000000000000000001037,
+				000000000000000000001039,
+				00000000000000000000103B,
+				00000000000000000000103D,
+				00000000000000000000103F,
+				000000000000000000001041,
+				000000000000000000001043,
+				000000000000000000001045,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

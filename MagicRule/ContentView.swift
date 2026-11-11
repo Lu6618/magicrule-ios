@@ -335,9 +335,10 @@ struct ContentView: View {
 
     private var overviewStats: some View {
         HStack(spacing: 12) {
-            StatCard(value: CountFormat.plain(store.totalRuleCount), label: "规则", accent: false)
+            // 摘要还在后台加载时显示占位，解完立刻填数。
+            StatCard(value: store.summaries.isEmpty ? "…" : CountFormat.plain(store.totalRuleCount), label: "规则", accent: false)
             StatCard(value: "\(MagicRuleClient.all.count)", label: "客户端", accent: true)
-            StatCard(value: RelativeFormat.string(from: store.latestGeneratedAt), label: "最近更新", accent: false)
+            StatCard(value: store.summaries.isEmpty ? "加载中" : RelativeFormat.string(from: store.latestGeneratedAt), label: "最近更新", accent: false)
         }
         .padding(.horizontal, 20)
     }
@@ -355,8 +356,7 @@ struct ContentView: View {
                     NavigationLink(value: client) {
                         ClientCard(
                             client: client,
-                            count: store.rules(for: client).count,
-                            updated: store.generatedAt(for: client)
+                            summary: store.summary(for: client)
                         )
                     }
                     .buttonStyle(.plain)
@@ -371,20 +371,12 @@ struct ContentView: View {
 
 private struct ClientCard: View {
     let client: String
-    let count: Int
-    let updated: Date?
+    let summary: ClientSummary?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Theme.accentSoft)
-                        .frame(width: 44, height: 44)
-                    Text(String(client.prefix(1)))
-                        .font(.system(size: 20, weight: .bold))
-                        .foregroundStyle(Theme.accent)
-                }
+                ClientIconView(client: client, size: 44)
                 Spacer()
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
@@ -396,10 +388,10 @@ private struct ClientCard: View {
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
-            Text("\(CountFormat.plain(count)) 条规则")
+            Text(summary == nil ? "加载中…" : "\(CountFormat.plain(summary!.ruleCount)) 条规则")
                 .font(.subheadline)
                 .foregroundStyle(Theme.secondary)
-            Text("更新于 \(RelativeFormat.string(from: updated))")
+            Text(summary == nil ? "" : "更新于 \(RelativeFormat.string(from: summary!.generatedAt))")
                 .font(.caption)
                 .foregroundStyle(Theme.tertiary)
                 .lineLimit(1)
@@ -456,27 +448,24 @@ struct ClientRulesView: View {
         .navigationDestination(for: MagicRule.self) { rule in
             RuleDetailView(rule: rule, client: client, onToast: onToast)
         }
+        .task {
+            // 懒加载：点进二级页时才在后台解码该客户端的完整规则列表。
+            await store.ensureRulesLoaded(for: client)
+        }
     }
 
     // MARK: - 客户端头
 
     private var clientHeader: some View {
         HStack(spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Theme.accentSoft)
-                    .frame(width: 56, height: 56)
-                Text(String(client.prefix(1)))
-                    .font(.system(size: 26, weight: .bold))
-                    .foregroundStyle(Theme.accent)
-            }
+            ClientIconView(client: client, size: 56)
             VStack(alignment: .leading, spacing: 4) {
                 Text(client)
                     .font(.system(size: 28, weight: .bold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                Text("客户端 · \(CountFormat.plain(allRules.count)) 条规则")
+                Text("客户端 · \(CountFormat.plain(store.summary(for: client)?.ruleCount ?? allRules.count)) 条规则")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
             }
@@ -489,8 +478,8 @@ struct ClientRulesView: View {
 
     private var statCards: some View {
         HStack(spacing: 12) {
-            StatCard(value: CountFormat.plain(allRules.count), label: "规则", accent: false)
-            StatCard(value: "\(distinctTypeCount)", label: "规则类型", accent: true)
+            StatCard(value: CountFormat.plain(store.summary(for: client)?.ruleCount ?? allRules.count), label: "规则", accent: false)
+            StatCard(value: store.isClientLoaded(client) ? "\(distinctTypeCount)" : "…", label: "规则类型", accent: true)
             StatCard(value: RelativeFormat.string(from: store.generatedAt(for: client)), label: "最近更新", accent: false)
         }
         .padding(.horizontal, 20)
@@ -562,7 +551,18 @@ struct ClientRulesView: View {
             }
             .padding(.horizontal, 20)
 
-            if results.isEmpty {
+            if !store.isClientLoaded(client) && allRules.isEmpty {
+                // 懒加载中：完整规则还在后台解码，先显示加载态，不堵界面。
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text("正在加载规则…")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 48)
+            } else if results.isEmpty {
                 VStack(spacing: 12) {
                     ZStack {
                         Circle()
@@ -675,6 +675,65 @@ private struct RuleRowCard: View {
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).stroke(Theme.cardStroke, lineWidth: 1))
         .shadow(color: .black.opacity(0.05), radius: 10, y: 3)
+    }
+}
+
+// MARK: - 客户端图标（打包进 Bundle 的真实图标，离线可用）
+//
+// 图标来源：MagicRule 网页版前端的静态资源 `https://magicrule.pages.dev/logos/<小写客户端名>.png`
+//（网页版 JS 里就是 `./logos/${name.toLowerCase()}.png`），11 个已全部下载进 Bundle
+//（Anywhere 原图 1024px/1MB 已压到 512px）。加载一次后进内存缓存；App 启动时在后台预热，
+// 首屏渲染不卡。找不到图标时回退到首字母瓦片，不空白。
+enum ClientIcon {
+    private static var cache: [String: UIImage] = [:]
+    private static let lock = NSLock()
+
+    static func image(for client: String) -> UIImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let img = cache[client] { return img }
+        guard let url = Bundle.main.url(forResource: client, withExtension: "png"),
+              let img = UIImage(contentsOfFile: url.path) else {
+            return nil
+        }
+        cache[client] = img
+        return img
+    }
+
+    /// 后台预热：把 11 个客户端图标先解码进缓存。
+    static func prewarm() {
+        for client in MagicRuleClient.all {
+            _ = image(for: client)
+        }
+    }
+}
+
+struct ClientIconView: View {
+    let client: String
+    let size: CGFloat
+
+    var body: some View {
+        Group {
+            if let uiImage = ClientIcon.image(for: client) {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: size * 0.27)
+                        .fill(Theme.accentSoft)
+                    Text(String(client.prefix(1)))
+                        .font(.system(size: size * 0.45, weight: .bold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: size * 0.27))
+        .overlay {
+            RoundedRectangle(cornerRadius: size * 0.27)
+                .stroke(Theme.cardStroke, lineWidth: 1)
+        }
     }
 }
 

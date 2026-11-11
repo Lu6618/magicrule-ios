@@ -64,6 +64,15 @@ struct ClientIndex: Codable {
     let rules: [MagicRule]
 }
 
+/// 客户端轻量摘要：首页只需要名字、规则条数、最近更新时间。
+/// 启动时只解摘要（不解 11,841 条规则内容），首页才能立刻出现；
+/// 点进某客户端二级页时再后台解码该客户端的完整规则列表。
+struct ClientSummary: Equatable {
+    let client: String
+    let ruleCount: Int
+    let generatedAt: Date?
+}
+
 /// 11 个客户端，顺序与 MagicRule 站点一致。
 enum MagicRuleClient {
     static let all: [String] = [

@@ -7,6 +7,13 @@ import Network
 /// - Worker：`https://magicrule-crawler.8868.workers.dev/data/index/<Client>.json`，
 ///   打开时自动拉一次，也支持下拉手动刷新；拉到的 JSON 写文件缓存。
 /// - 缓存：没网时用缓存，缓存也没有时用内置数据。
+///
+/// 性能设计（build 9，解决启动卡顿）：
+/// - 启动时只在后台解各客户端的轻量摘要（名字、规则条数、最近更新时间），
+///   首页立刻出现；完整规则列表按客户端懒加载，点进二级页时才在后台解码。
+/// - 所有 JSON 解码都在后台线程（Task.detached / 非隔离静态方法），
+///   @MainActor 的 Store 只持有结果、驱动界面，主线程不做解码。
+/// - Worker 拉回来的 JSON 解码、写缓存的编码也都在后台做。
 @MainActor
 final class MagicRuleStore: ObservableObject {
     enum Source: Equatable {
@@ -22,12 +29,18 @@ final class MagicRuleStore: ObservableObject {
     /// 每次缓存格式或数据语义变化时把这个数字加 1。
     nonisolated static let cacheVersion = 2
 
+    /// 各客户端轻量摘要（首页用）。启动时后台加载，首页先出骨架再填数。
+    @Published private(set) var summaries: [String: ClientSummary] = [:]
+    /// 完整规则列表（按客户端懒加载）。
     @Published private(set) var rulesByClient: [String: [MagicRule]] = [:]
-    @Published private(set) var generatedAtByClient: [String: Date] = [:]
     @Published private(set) var source: Source = .bundled
     @Published private(set) var isLoading = false
     @Published private(set) var isOffline = false
     @Published var notice: String?
+    /// 已完成完整规则加载的客户端。
+    @Published private(set) var loadedClients: Set<String> = []
+    /// 正在后台解码完整规则的客户端（二级页显示加载中）。
+    @Published private(set) var loadingClients: Set<String> = []
 
     private let monitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "magicrule.network")
@@ -40,32 +53,46 @@ final class MagicRuleStore: ObservableObject {
     }
 
     init() {
-        loadBundled()
-        loadCache()
         monitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor in self?.isOffline = path.status != .satisfied }
         }
         monitor.start(queue: monitorQueue)
+        // 启动不堵界面：摘要在后台解，解完回主线程发布；首页先出骨架。
+        Task { await loadSummariesAndRefresh() }
     }
 
     // MARK: - 派生状态
 
     var totalRuleCount: Int {
-        rulesByClient.values.reduce(0) { $0 + $1.count }
+        summaries.values.reduce(0) { $0 + $1.ruleCount }
+    }
+
+    func summary(for client: String) -> ClientSummary? {
+        summaries[client]
     }
 
     func rules(for client: String) -> [MagicRule] {
         rulesByClient[client] ?? []
     }
 
+    /// 该客户端的完整规则是否已加载进内存。
+    func isClientLoaded(_ client: String) -> Bool {
+        loadedClients.contains(client)
+    }
+
+    /// 该客户端的完整规则是否正在后台解码。
+    func isClientLoading(_ client: String) -> Bool {
+        loadingClients.contains(client)
+    }
+
     /// 最新一条索引的生成时间（各客户端取最大）。
     var latestGeneratedAt: Date? {
-        generatedAtByClient.values.max()
+        summaries.values.compactMap { $0.generatedAt }.max()
     }
 
     /// 某个客户端索引的生成时间。
     func generatedAt(for client: String) -> Date? {
-        generatedAtByClient[client]
+        summaries[client]?.generatedAt
     }
 
     var sourceText: String {
@@ -83,77 +110,37 @@ final class MagicRuleStore: ObservableObject {
         return sourceText
     }
 
-    // MARK: - 内置数据
+    // MARK: - 启动：后台加载摘要，再触发 Worker 刷新
 
-    private func loadBundled() {
-        for client in MagicRuleClient.all {
-            guard let url = Bundle.main.url(forResource: client, withExtension: "json"),
-                  let data = try? Data(contentsOf: url),
-                  let index = try? Self.decoder.decode(ClientIndex.self, from: data) else {
-                continue
-            }
-            rulesByClient[client] = index.rules
-            if let date = MagicRule.date(from: index.generatedAt) {
-                generatedAtByClient[client] = date
-            }
-        }
-        source = .bundled
+    private func loadSummariesAndRefresh() async {
+        let loaded = await Task.detached(priority: .userInitiated) {
+            await Self.loadSummariesFromDisk()
+        }.value
+        summaries = loaded.summaries
+        source = loaded.source
+        await refreshIfNeeded()
     }
 
-    // MARK: - 文件缓存
+    // MARK: - 按客户端懒加载完整规则
 
-    private var cacheDirectory: URL {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("MagicRuleIndex", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
-
-    private func cacheURL(for client: String) -> URL {
-        cacheDirectory.appendingPathComponent("\(client).json")
-    }
-
-    private var cacheVersionURL: URL {
-        cacheDirectory.appendingPathComponent("version")
-    }
-
-    /// 丢弃全部本地缓存（版本不对时调用，也用于旧版本升级）。
-    private func discardCache() {
-        let fm = FileManager.default
-        for client in MagicRuleClient.all {
-            try? fm.removeItem(at: cacheURL(for: client))
-        }
-        try? fm.removeItem(at: cacheVersionURL)
-    }
-
-    private func loadCache() {
-        // 版本校验：没有版本号文件、或版本号对不上，一律丢弃缓存，只用内置数据，
-        // 再由 refresh() 从 Worker 拉最新数据并按新版本重写缓存。
-        // 这样从 build 4 / build 6 升级上来的旧缓存一定被丢弃，不会再盖住正确数据。
-        let version = try? String(contentsOf: cacheVersionURL, encoding: .utf8)
-        guard version?.trimmingCharacters(in: .whitespacesAndNewlines) == "\(Self.cacheVersion)" else {
-            discardCache()
-            return
-        }
-        var loadedAny = false
-        for client in MagicRuleClient.all {
-            let url = cacheURL(for: client)
-            guard let data = try? Data(contentsOf: url),
-                  let index = try? Self.decoder.decode(ClientIndex.self, from: data) else {
-                continue
-            }
-            rulesByClient[client] = index.rules
-            if let date = MagicRule.date(from: index.generatedAt) {
-                generatedAtByClient[client] = date
-            }
-            loadedAny = true
-        }
-        if loadedAny { source = .cache }
-    }
-
-    private func saveCache(client: String, data: Data) {
-        try? data.write(to: cacheURL(for: client), options: .atomic)
-        try? "\(Self.cacheVersion)".write(to: cacheVersionURL, atomically: true, encoding: .utf8)
+    /// 进入某客户端二级页时调用：后台解码该客户端的完整规则列表。
+    /// 已加载过直接返回；加载中由 loadingClients 驱动二级页的加载状态。
+    func ensureRulesLoaded(for client: String) async {
+        if loadedClients.contains(client) || loadingClients.contains(client) { return }
+        loadingClients.insert(client)
+        let index = await Task.detached(priority: .userInitiated) {
+            Self.loadFullIndex(for: client)
+        }.value
+        loadingClients.remove(client)
+        guard let index else { return }
+        rulesByClient[client] = index.rules
+        let date = MagicRule.date(from: index.generatedAt)
+        summaries[client] = ClientSummary(
+            client: client,
+            ruleCount: index.rules.count,
+            generatedAt: date ?? summaries[client]?.generatedAt
+        )
+        loadedClients.insert(client)
     }
 
     // MARK: - Worker 刷新
@@ -171,8 +158,8 @@ final class MagicRuleStore: ObservableObject {
         notice = nil
         defer { isLoading = false }
 
-        var fetched: [String: ClientIndex] = [:]
-        await withTaskGroup(of: (String, ClientIndex?).self) { group in
+        // 1. 并行拉取（纯网络 I/O，不解码）。
+        let fetchedData: [(String, Data)] = await withTaskGroup(of: (String, Data?).self) { group in
             for client in MagicRuleClient.all {
                 group.addTask {
                     let url = URL(string: "\(Self.workerBase)/data/index/\(client).json")!
@@ -183,19 +170,20 @@ final class MagicRuleStore: ObservableObject {
                         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                             return (client, nil)
                         }
-                        let index = try Self.decoder.decode(ClientIndex.self, from: data)
-                        return (client, index)
+                        return (client, data)
                     } catch {
                         return (client, nil)
                     }
                 }
             }
-            for await (client, index) in group {
-                if let index { fetched[client] = index }
+            var out: [(String, Data)] = []
+            for await (client, data) in group {
+                if let data { out.append((client, data)) }
             }
+            return out
         }
 
-        if fetched.isEmpty {
+        if fetchedData.isEmpty {
             // 全部失败：保持现有数据（缓存或内置），只提示。
             if isOffline {
                 notice = "当前离线，显示的是\(sourceText)。"
@@ -205,19 +193,33 @@ final class MagicRuleStore: ObservableObject {
             return
         }
 
-        // 部分成功也更新成功的客户端，并写缓存。
-        for (client, index) in fetched {
+        // 2. 后台解码 + 写缓存（编码也在后台做，不堵主线程）。
+        let decoded = await Task.detached(priority: .userInitiated) {
+            var result: [(String, ClientIndex)] = []
+            for (client, data) in fetchedData {
+                guard let index = Self.decodeIndex(from: data) else { continue }
+                result.append((client, index))
+                if let encoded = try? JSONEncoder().encode(index) {
+                    Self.saveCacheData(client: client, data: encoded)
+                }
+            }
+            return result
+        }.value
+
+        // 3. 回主线程发布。
+        for (client, index) in decoded {
             rulesByClient[client] = index.rules
-            if let date = MagicRule.date(from: index.generatedAt) {
-                generatedAtByClient[client] = date
-            }
-            if let data = try? JSONEncoder().encode(index) {
-                saveCache(client: client, data: data)
-            }
+            let date = MagicRule.date(from: index.generatedAt)
+            summaries[client] = ClientSummary(
+                client: client,
+                ruleCount: index.rules.count,
+                generatedAt: date ?? summaries[client]?.generatedAt
+            )
+            loadedClients.insert(client)
         }
         source = .worker
-        if fetched.count < MagicRuleClient.all.count {
-            notice = "已更新 \(fetched.count)/\(MagicRuleClient.all.count) 个客户端，其余仍用旧数据。"
+        if decoded.count < MagicRuleClient.all.count {
+            notice = "已更新 \(decoded.count)/\(MagicRuleClient.all.count) 个客户端，其余仍用旧数据。"
         }
     }
 
@@ -238,5 +240,124 @@ final class MagicRuleStore: ObservableObject {
                 || (rule.chineseName?.lowercased().contains(q) ?? false)
                 || rule.displayName.lowercased().contains(q)
         }
+    }
+
+    // MARK: - 后台解码（非隔离静态方法，不碰主线程）
+
+    /// 轻量摘要解码：只读 generated_at 和 rules 条数，不解码每条规则的内容。
+    /// 用 JSONSerialization 只解析顶层结构，比 Codable 全量解码轻得多。
+    /// 注意缓存文件是 Codable 编码的驼峰 key（generatedAt），内置文件是蛇形 key（generated_at），两种都认。
+    nonisolated static func decodeSummary(client: String, from data: Data) -> ClientSummary? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let count = (obj["rules"] as? [Any])?.count ?? 0
+        let generatedAtString = (obj["generated_at"] as? String) ?? (obj["generatedAt"] as? String)
+        return ClientSummary(
+            client: client,
+            ruleCount: count,
+            generatedAt: MagicRule.date(from: generatedAtString)
+        )
+    }
+
+    /// 完整索引解码（Codable 全量，11,841 条规则，约 12 个字段/条）。
+    nonisolated static func decodeIndex(from data: Data) -> ClientIndex? {
+        try? decoder.decode(ClientIndex.self, from: data)
+    }
+
+    /// 后台：读内置 + 缓存，解出各客户端摘要。返回（摘要，来源）。
+    /// 先读内置（来源 .bundled），再读缓存覆盖（版本有效时来源变 .cache）。
+    nonisolated static func loadSummariesFromDisk() async -> (summaries: [String: ClientSummary], source: Source) {
+        var summaries: [String: ClientSummary] = [:]
+        // 内置摘要：并行解。
+        await withTaskGroup(of: (String, ClientSummary?).self) { group in
+            for client in MagicRuleClient.all {
+                group.addTask {
+                    guard let url = Bundle.main.url(forResource: client, withExtension: "json"),
+                          let data = try? Data(contentsOf: url) else {
+                        return (client, nil)
+                    }
+                    return (client, decodeSummary(client: client, from: data))
+                }
+            }
+            for await (client, summary) in group {
+                if let summary { summaries[client] = summary }
+            }
+        }
+        var source: Source = .bundled
+        // 缓存摘要（版本校验）。
+        if cacheVersionIsValid() {
+            var loadedAny = false
+            await withTaskGroup(of: (String, ClientSummary?).self) { group in
+                for client in MagicRuleClient.all {
+                    group.addTask {
+                        guard let data = try? Data(contentsOf: cacheURL(for: client)) else {
+                            return (client, nil)
+                        }
+                        return (client, decodeSummary(client: client, from: data))
+                    }
+                }
+                for await (client, summary) in group {
+                    if let summary {
+                        summaries[client] = summary
+                        loadedAny = true
+                    }
+                }
+            }
+            if loadedAny { source = .cache }
+        } else {
+            discardCacheFiles()
+        }
+        return (summaries, source)
+    }
+
+    /// 后台：读某客户端的完整索引。优先缓存（版本有效时），否则内置。
+    nonisolated static func loadFullIndex(for client: String) -> ClientIndex? {
+        if cacheVersionIsValid(),
+           let data = try? Data(contentsOf: cacheURL(for: client)),
+           let index = decodeIndex(from: data) {
+            return index
+        }
+        guard let url = Bundle.main.url(forResource: client, withExtension: "json"),
+              let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        return decodeIndex(from: data)
+    }
+
+    // MARK: - 文件缓存（静态方法，可在后台线程调用）
+
+    nonisolated static func cacheDirectoryURL() -> URL {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MagicRuleIndex", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    nonisolated static func cacheURL(for client: String) -> URL {
+        cacheDirectoryURL().appendingPathComponent("\(client).json")
+    }
+
+    nonisolated static func cacheVersionURL() -> URL {
+        cacheDirectoryURL().appendingPathComponent("version")
+    }
+
+    nonisolated static func cacheVersionIsValid() -> Bool {
+        let version = try? String(contentsOf: cacheVersionURL(), encoding: .utf8)
+        return version?.trimmingCharacters(in: .whitespacesAndNewlines) == "\(cacheVersion)"
+    }
+
+    /// 丢弃全部本地缓存（版本不对时调用，也用于旧版本升级）。
+    nonisolated static func discardCacheFiles() {
+        let fm = FileManager.default
+        for client in MagicRuleClient.all {
+            try? fm.removeItem(at: cacheURL(for: client))
+        }
+        try? fm.removeItem(at: cacheVersionURL())
+    }
+
+    nonisolated static func saveCacheData(client: String, data: Data) {
+        try? data.write(to: cacheURL(for: client), options: .atomic)
+        try? "\(cacheVersion)".write(to: cacheVersionURL(), atomically: true, encoding: .utf8)
     }
 }
