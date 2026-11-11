@@ -75,35 +75,163 @@ enum RelativeFormat {
     }
 }
 
-/// 首页：品牌行 + 客户端头 + 统计卡 + 客户端切换 + 搜索 + 规则列表。
+// MARK: - 排序：更新时间（默认）/ 名字 A-Z / 行数 / 类型数
+enum RuleSort: String, CaseIterable, Identifiable {
+    case updated
+    case name
+    case lines
+    case types
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .updated: return "更新"
+        case .name: return "名字"
+        case .lines: return "行数"
+        case .types: return "类型"
+        }
+    }
+
+    func sort(_ rules: [MagicRule]) -> [MagicRule] {
+        switch self {
+        case .updated:
+            return rules.sorted {
+                switch ($0.updatedDate, $1.updatedDate) {
+                case let (a?, b?): return a > b
+                case (_?, nil): return true
+                case (nil, _?): return false
+                default: return $0.name.lowercased() < $1.name.lowercased()
+                }
+            }
+        case .name:
+            return rules.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        case .lines:
+            return rules.sorted { $0.totalLineCount > $1.totalLineCount }
+        case .types:
+            return rules.sorted {
+                if $0.types.count != $1.types.count { return $0.types.count > $1.types.count }
+                return $0.name.lowercased() < $1.name.lowercased()
+            }
+        }
+    }
+}
+
+// MARK: - 剪贴板（带成功校验）
+enum Clipboard {
+    @discardableResult
+    static func copy(_ string: String) -> Bool {
+        UIPasteboard.general.string = string
+        return UIPasteboard.general.string == string
+    }
+}
+
+// MARK: - 一键导入
+//
+// 各客户端的规则导入 URL Scheme（已按官方文档核实）：
+// - QuantumultX（官方 url-scheme.md）：quantumult-x:///add-resource?remote-resource=<url-encoded JSON>，
+//   JSON 为 {"filter_remote": ["<list地址>, tag=<规则名>, force-policy=PROXY"]}，只追加不替换已有资源。
+// - Loon（官方 nsloon.app 文档）：loon://import?rules=<url-encoded 规则地址>。
+// - Surge：官方只有 install-config（整配置，会替换用户配置，危险）和 install-module（.sgmodule），
+//   没有单条规则集的导入 Scheme，走复制兜底。
+// - Stash / SingBox：只有整配置导入（stash://install-config、sing-box://import-remote-profile），
+//   单条 .list 规则集无法用它们导入，走复制兜底。
+// - Shadowrocket / Egern / Surfboard / Mihomo / AdGuard / Anywhere：无公开的规则导入 Scheme，走复制兜底。
+enum RuleImport {
+    /// 只保留 RFC 3986 不需编码的字符，其余全部百分号编码。
+    /// 用于把一段 JSON 或一整条 URL 整体放进 query 参数，避免 & = 等字符截断参数。
+    private static let queryValueAllowed =
+        CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+
+    /// 该客户端是否支持 URL Scheme 一键导入。
+    static func supportsImport(client: String) -> Bool {
+        client == "QuantumultX" || client == "Loon"
+    }
+
+    /// 构造某客户端的一键导入 URL；不支持的客户端返回 nil（调用方走复制兜底）。
+    static func importURL(for client: String, listURL: URL, ruleName: String) -> (url: URL, appName: String)? {
+        switch client {
+        case "QuantumultX":
+            let entry = "\(listURL.absoluteString), tag=\(ruleName), force-policy=PROXY"
+            guard let jsonData = try? JSONSerialization.data(
+                withJSONObject: ["filter_remote": [entry]], options: []),
+                  let json = String(data: jsonData, encoding: .utf8),
+                  let encoded = json.addingPercentEncoding(withAllowedCharacters: queryValueAllowed),
+                  let url = URL(string: "quantumult-x:///add-resource?remote-resource=\(encoded)") else {
+                return nil
+            }
+            return (url, "QuantumultX")
+        case "Loon":
+            guard let encoded = listURL.absoluteString
+                .addingPercentEncoding(withAllowedCharacters: queryValueAllowed),
+                  let url = URL(string: "loon://import?rules=\(encoded)") else {
+                return nil
+            }
+            return (url, "Loon")
+        default:
+            return nil
+        }
+    }
+
+    /// 可复制/分享的链接：优先 manifest，其次第一个 provider。
+    static func shareURL(for rule: MagicRule) -> URL? {
+        if let m = rule.manifest, let url = URL(string: m) { return url }
+        return rule.providers.compactMap { URL(string: $0) }.first
+    }
+
+    /// 把一条规则解析成可导入的 .list 地址：
+    /// 优先读 manifest.json 的 artifacts（取 ext 为 list 的那条），
+    /// 拿不到时退回第一个 raw.githubusercontent.com 的 provider，再拿不到退回第一个 provider。
+    static func resolveListURL(for rule: MagicRule) async -> URL? {
+        if let manifestString = rule.manifest,
+           let manifestURL = URL(string: manifestString) {
+            var request = URLRequest(url: manifestURL)
+            request.timeoutInterval = 10
+            if let (data, _) = try? await URLSession.shared.data(for: request),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let artifacts = json["artifacts"] as? [[String: Any]], !artifacts.isEmpty {
+                let pick = artifacts.first(where: { ($0["ext"] as? String) == "list" }) ?? artifacts[0]
+                if let urlString = pick["url"] as? String, let url = URL(string: urlString) {
+                    return url
+                }
+            }
+        }
+        for p in rule.providers where p.contains("raw.githubusercontent.com") {
+            if let url = URL(string: p) { return url }
+        }
+        if let first = rule.providers.first, let url = URL(string: first) {
+            return url
+        }
+        return nil
+    }
+
+    /// 一键导入：返回一句 Toast 文案。
+    /// 对应 App 能打开时直接打开；没装或 Scheme 打不开时复制 .list 链接并提示手动导入。
+    static func attemptImport(client: String, rule: MagicRule) async -> String {
+        guard let listURL = await resolveListURL(for: rule) else {
+            if let url = shareURL(for: rule) {
+                return Clipboard.copy(url.absoluteString) ? "已复制链接，请手动导入" : "复制失败，请重试"
+            }
+            return "没有可导入的链接"
+        }
+        if let (importURL, appName) = importURL(for: client, listURL: listURL, ruleName: rule.displayName) {
+            if UIApplication.shared.canOpenURL(importURL) {
+                UIApplication.shared.open(importURL, options: [:], completionHandler: nil)
+                return "正在打开\(appName)导入…"
+            }
+            return Clipboard.copy(listURL.absoluteString) ? "已复制链接，请手动导入" : "复制失败，请重试"
+        }
+        return Clipboard.copy(listURL.absoluteString) ? "已复制链接，请手动导入" : "复制失败，请重试"
+    }
+}
+
+/// 首页：只用来选代理工具。点进一个客户端后进入二级页查看/搜索规则。
 struct ContentView: View {
     @StateObject private var store = MagicRuleStore()
-    @State private var selectedClient: String? = "QuantumultX"
-    @State private var query = ""
     @State private var toast: String?
-    @FocusState private var searchFocused: Bool
 
-    private var results: [MagicRule] {
-        store.search(query, scope: selectedClient)
-    }
-
-    /// 当前选中客户端（或全部）的全部规则（不受搜索过滤）。
-    private var currentRules: [MagicRule] {
-        if let selectedClient {
-            return store.rules(for: selectedClient)
-        }
-        return MagicRuleClient.all.flatMap { store.rules(for: $0) }
-    }
-
-    private var distinctTypeCount: Int {
-        Set(currentRules.flatMap { $0.types }).count
-    }
-
-    private var latestUpdate: Date? {
-        if let selectedClient {
-            return store.generatedAt(for: selectedClient)
-        }
-        return store.latestGeneratedAt
+    private var columns: [GridItem] {
+        [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
     }
 
     var body: some View {
@@ -111,10 +239,8 @@ struct ContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     brandRow
-                    clientHeader
-                    statCards
-                    clientPicker
-                    searchBar
+                    overviewStats
+                    clientGrid
                     if let notice = store.notice {
                         Text(notice)
                             .font(.caption)
@@ -127,7 +253,6 @@ struct ContentView: View {
                             .foregroundStyle(Theme.accent)
                             .padding(.horizontal, 20)
                     }
-                    resultList
                 }
                 .padding(.bottom, 24)
                 .padding(.top, 6)
@@ -137,22 +262,26 @@ struct ContentView: View {
                 await store.refresh(force: true)
             }
             .toolbar(.hidden, for: .navigationBar)
-            .overlay(alignment: .bottom) {
-                if let toast {
-                    ToastView(text: toast)
-                        .padding(.bottom, 16)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .animation(.spring(response: 0.4, dampingFraction: 0.85), value: toast)
-            .task(id: toast) {
-                guard toast != nil else { return }
-                try? await Task.sleep(for: .seconds(2.2))
-                toast = nil
+            .navigationDestination(for: String.self) { client in
+                ClientRulesView(client: client, store: store, onToast: { toast = $0 })
             }
             .task {
                 await store.refreshIfNeeded()
             }
+        }
+        // Toast 挂在 NavigationStack 这一层，二级页/详情页里也能看到。
+        .overlay(alignment: .bottom) {
+            if let toast {
+                ToastView(text: toast)
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: toast)
+        .task(id: toast) {
+            guard toast != nil else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            toast = nil
         }
     }
 
@@ -202,6 +331,133 @@ struct ContentView: View {
         .padding(.horizontal, 20)
     }
 
+    // MARK: - 总览统计
+
+    private var overviewStats: some View {
+        HStack(spacing: 12) {
+            StatCard(value: CountFormat.plain(store.totalRuleCount), label: "规则", accent: false)
+            StatCard(value: "\(MagicRuleClient.all.count)", label: "客户端", accent: true)
+            StatCard(value: RelativeFormat.string(from: store.latestGeneratedAt), label: "最近更新", accent: false)
+        }
+        .padding(.horizontal, 20)
+    }
+
+    // MARK: - 客户端网格
+
+    private var clientGrid: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("选择客户端")
+                .font(.headline)
+                .foregroundStyle(Theme.text)
+                .padding(.horizontal, 20)
+            LazyVGrid(columns: columns, spacing: 12) {
+                ForEach(MagicRuleClient.all, id: \.self) { client in
+                    NavigationLink(value: client) {
+                        ClientCard(
+                            client: client,
+                            count: store.rules(for: client).count,
+                            updated: store.generatedAt(for: client)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 20)
+        }
+    }
+}
+
+// MARK: - 客户端卡片（首页）
+
+private struct ClientCard: View {
+    let client: String
+    let count: Int
+    let updated: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Theme.accentSoft)
+                        .frame(width: 44, height: 44)
+                    Text(String(client.prefix(1)))
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundStyle(Theme.accent)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.tertiary)
+                    .padding(.top, 4)
+            }
+            Text(client)
+                .font(.headline)
+                .foregroundStyle(Theme.text)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            Text("\(CountFormat.plain(count)) 条规则")
+                .font(.subheadline)
+                .foregroundStyle(Theme.secondary)
+            Text("更新于 \(RelativeFormat.string(from: updated))")
+                .font(.caption)
+                .foregroundStyle(Theme.tertiary)
+                .lineLimit(1)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Theme.cardStroke, lineWidth: 1))
+        .shadow(color: .black.opacity(0.05), radius: 10, y: 3)
+    }
+}
+
+// MARK: - 二级页：某客户端的规则（查看 + 搜索 + 排序）
+
+struct ClientRulesView: View {
+    let client: String
+    @ObservedObject var store: MagicRuleStore
+    let onToast: (String) -> Void
+
+    @State private var query = ""
+    @State private var sort: RuleSort = .updated
+    @FocusState private var searchFocused: Bool
+
+    private var allRules: [MagicRule] {
+        store.rules(for: client)
+    }
+
+    private var results: [MagicRule] {
+        sort.sort(store.search(query, scope: client))
+    }
+
+    private var distinctTypeCount: Int {
+        Set(allRules.flatMap { $0.types }).count
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                clientHeader
+                statCards
+                searchBar
+                sortControl
+                resultList
+            }
+            .padding(.bottom, 24)
+            .padding(.top, 8)
+        }
+        .background(Theme.bg.ignoresSafeArea())
+        .refreshable {
+            await store.refresh(force: true)
+        }
+        .navigationTitle(client)
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(for: MagicRule.self) { rule in
+            RuleDetailView(rule: rule, client: client, onToast: onToast)
+        }
+    }
+
     // MARK: - 客户端头
 
     private var clientHeader: some View {
@@ -210,25 +466,17 @@ struct ContentView: View {
                 RoundedRectangle(cornerRadius: 16)
                     .fill(Theme.accentSoft)
                     .frame(width: 56, height: 56)
-                if let client = selectedClient {
-                    Text(String(client.prefix(1)))
-                        .font(.system(size: 26, weight: .bold))
-                        .foregroundStyle(Theme.accent)
-                } else {
-                    Image(systemName: "square.grid.2x2")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(Theme.accent)
-                }
+                Text(String(client.prefix(1)))
+                    .font(.system(size: 26, weight: .bold))
+                    .foregroundStyle(Theme.accent)
             }
             VStack(alignment: .leading, spacing: 4) {
-                Text(selectedClient ?? "全部规则")
+                Text(client)
                     .font(.system(size: 28, weight: .bold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                Text(selectedClient == nil
-                     ? "11 个客户端 · \(CountFormat.plain(store.totalRuleCount)) 条规则"
-                     : "客户端 · \(CountFormat.plain(currentRules.count)) 条规则")
+                Text("客户端 · \(CountFormat.plain(allRules.count)) 条规则")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
             }
@@ -241,60 +489,11 @@ struct ContentView: View {
 
     private var statCards: some View {
         HStack(spacing: 12) {
-            StatCard(value: CountFormat.plain(currentRules.count), label: "规则", accent: false)
+            StatCard(value: CountFormat.plain(allRules.count), label: "规则", accent: false)
             StatCard(value: "\(distinctTypeCount)", label: "规则类型", accent: true)
-            StatCard(value: RelativeFormat.string(from: latestUpdate), label: "最近更新", accent: false)
+            StatCard(value: RelativeFormat.string(from: store.generatedAt(for: client)), label: "最近更新", accent: false)
         }
         .padding(.horizontal, 20)
-    }
-
-    // MARK: - 客户端选择器
-
-    private var clientPicker: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
-                clientPill(title: "全部", count: store.totalRuleCount, selected: selectedClient == nil) {
-                    selectedClient = nil
-                }
-                ForEach(MagicRuleClient.all, id: \.self) { client in
-                    clientPill(
-                        title: client,
-                        count: store.rules(for: client).count,
-                        selected: selectedClient == client
-                    ) {
-                        selectedClient = client
-                    }
-                }
-            }
-            .padding(.horizontal, 20)
-        }
-    }
-
-    private func clientPill(title: String, count: Int, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Text(title)
-                    .font(.subheadline.weight(selected ? .semibold : .regular))
-                Text("\(count)")
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(selected ? Color.white.opacity(0.25) : Theme.badgeBg, in: Capsule())
-                    .foregroundStyle(selected ? .white : Theme.badgeText)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .foregroundStyle(selected ? .white : Theme.text)
-            .background {
-                if selected {
-                    Capsule().fill(Theme.amberGradient)
-                } else {
-                    Capsule().fill(Theme.card).stroke(Theme.cardStroke, lineWidth: 1)
-                }
-            }
-            .shadow(color: .black.opacity(selected ? 0.14 : 0.04), radius: selected ? 8 : 5, y: 2)
-        }
-        .buttonStyle(.plain)
     }
 
     // MARK: - 搜索框
@@ -331,6 +530,23 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.2), value: searchFocused)
     }
 
+    // MARK: - 排序
+
+    private var sortControl: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.up.arrow.down")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Theme.accent)
+            Picker("排序", selection: $sort) {
+                ForEach(RuleSort.allCases) { option in
+                    Text(option.label).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+        .padding(.horizontal, 20)
+    }
+
     // MARK: - 规则列表
 
     private var resultList: some View {
@@ -343,11 +559,6 @@ struct ContentView: View {
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
                 Spacer()
-                if selectedClient == nil {
-                    Text("跨客户端")
-                        .font(.caption)
-                        .foregroundStyle(Theme.secondary)
-                }
             }
             .padding(.horizontal, 20)
 
@@ -374,16 +585,13 @@ struct ContentView: View {
                 LazyVStack(spacing: 12) {
                     ForEach(results) { rule in
                         NavigationLink(value: rule) {
-                            RuleRowCard(rule: rule, client: selectedClient)
+                            RuleRowCard(rule: rule, client: client)
                         }
                         .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, 20)
             }
-        }
-        .navigationDestination(for: MagicRule.self) { rule in
-            RuleDetailView(rule: rule, onToast: { toast = $0 })
         }
     }
 }
@@ -422,7 +630,7 @@ private struct RuleRowCard: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            RuleIconView(urlString: rule.iconURL, size: 52)
+            RuleIconView(urlString: rule.iconURL, size: 52, label: rule.displayName)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
                     Text(rule.displayName)
@@ -470,11 +678,12 @@ private struct RuleRowCard: View {
     }
 }
 
-// MARK: - 规则图标（异步加载，失败回退 SF Symbol）
+// MARK: - 规则图标（异步加载 + 磁盘缓存，失败时显示名字首字占位）
 
 struct RuleIconView: View {
     let urlString: String?
     let size: CGFloat
+    var label: String? = nil
 
     var body: some View {
         Group {
@@ -505,11 +714,17 @@ struct RuleIconView: View {
 
     private var fallback: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: size * 0.24)
                 .fill(Theme.accentSoft)
-            Image(systemName: "globe")
-                .font(.body)
-                .foregroundStyle(Theme.accent)
+            if let label, let first = label.first {
+                Text(String(first))
+                    .font(.system(size: size * 0.42, weight: .bold))
+                    .foregroundStyle(Theme.accent)
+            } else {
+                Image(systemName: "globe")
+                    .font(.body)
+                    .foregroundStyle(Theme.accent)
+            }
         }
     }
 }
@@ -518,7 +733,10 @@ struct RuleIconView: View {
 
 struct RuleDetailView: View {
     let rule: MagicRule
+    let client: String
     let onToast: (String) -> Void
+
+    @State private var isImporting = false
 
     private var manifestURL: URL? {
         guard let m = rule.manifest else { return nil }
@@ -526,7 +744,7 @@ struct RuleDetailView: View {
     }
 
     private var shareURL: URL? {
-        manifestURL ?? rule.providers.compactMap { URL(string: $0) }.first
+        RuleImport.shareURL(for: rule)
     }
 
     var body: some View {
@@ -534,7 +752,7 @@ struct RuleDetailView: View {
             VStack(alignment: .leading, spacing: 20) {
                 // 标题区
                 HStack(spacing: 16) {
-                    RuleIconView(urlString: rule.iconURL, size: 72)
+                    RuleIconView(urlString: rule.iconURL, size: 72, label: rule.displayName)
                     VStack(alignment: .leading, spacing: 5) {
                         Text(rule.displayName)
                             .font(.title2.bold())
@@ -600,12 +818,11 @@ struct RuleDetailView: View {
                     .foregroundStyle(Theme.secondary)
                 }
 
-                // 操作
+                // 操作：复制链接 + 一键导入
                 HStack(spacing: 12) {
                     Button {
                         if let url = shareURL {
-                            UIPasteboard.general.string = url.absoluteString
-                            onToast("链接已复制")
+                            onToast(Clipboard.copy(url.absoluteString) ? "链接已复制" : "复制失败，请重试")
                         }
                     } label: {
                         Label("复制规则链接", systemImage: "doc.on.doc")
@@ -617,17 +834,35 @@ struct RuleDetailView: View {
                     .font(.body.weight(.semibold))
                     .disabled(shareURL == nil)
 
-                    if let url = shareURL {
-                        ShareLink(item: url) {
-                            Label("分享", systemImage: "square.and.arrow.up")
+                    Button {
+                        guard !isImporting else { return }
+                        isImporting = true
+                        Task {
+                            let message = await RuleImport.attemptImport(client: client, rule: rule)
+                            onToast(message)
+                            isImporting = false
+                        }
+                    } label: {
+                        if isImporting {
+                            ProgressView()
+                                .frame(minHeight: 48)
+                                .padding(.horizontal, 16)
+                        } else {
+                            Label("一键导入", systemImage: "square.and.arrow.down")
                                 .frame(minHeight: 48)
                                 .padding(.horizontal, 16)
                         }
-                        .buttonStyle(.plain)
-                        .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 14))
-                        .foregroundStyle(Theme.accent)
-                        .font(.body.weight(.semibold))
                     }
+                    .buttonStyle(.plain)
+                    .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 14))
+                    .foregroundStyle(Theme.accent)
+                    .font(.body.weight(.semibold))
+                    .disabled(shareURL == nil)
+                }
+                if !RuleImport.supportsImport(client: client) {
+                    Text("当前客户端暂不支持一键导入，点击将复制规则链接，请在 \(client) 内手动添加。")
+                        .font(.caption)
+                        .foregroundStyle(Theme.secondary)
                 }
 
                 // manifest
@@ -762,8 +997,7 @@ private struct LinkRow: View {
                 }
             }
             Button {
-                UIPasteboard.general.string = url.absoluteString
-                onToast("链接已复制")
+                onToast(Clipboard.copy(url.absoluteString) ? "链接已复制" : "复制失败，请重试")
             } label: {
                 Image(systemName: "doc.on.doc")
                     .font(.caption)

@@ -17,6 +17,11 @@ final class MagicRuleStore: ObservableObject {
 
     nonisolated static let workerBase = "https://magicrule-crawler.8868.workers.dev"
 
+    /// 缓存版本号。升级 App 时旧版本缓存一律丢弃（build 4 的缓存里中文名/icon 是被污染的旧数据，
+    /// Caches 目录跨版本保留，不加版本控制会一直盖住正确的内置数据，导致中文搜索和图标持续出错）。
+    /// 每次缓存格式或数据语义变化时把这个数字加 1。
+    nonisolated static let cacheVersion = 2
+
     @Published private(set) var rulesByClient: [String: [MagicRule]] = [:]
     @Published private(set) var generatedAtByClient: [String: Date] = [:]
     @Published private(set) var source: Source = .bundled
@@ -108,7 +113,28 @@ final class MagicRuleStore: ObservableObject {
         cacheDirectory.appendingPathComponent("\(client).json")
     }
 
+    private var cacheVersionURL: URL {
+        cacheDirectory.appendingPathComponent("version")
+    }
+
+    /// 丢弃全部本地缓存（版本不对时调用，也用于旧版本升级）。
+    private func discardCache() {
+        let fm = FileManager.default
+        for client in MagicRuleClient.all {
+            try? fm.removeItem(at: cacheURL(for: client))
+        }
+        try? fm.removeItem(at: cacheVersionURL)
+    }
+
     private func loadCache() {
+        // 版本校验：没有版本号文件、或版本号对不上，一律丢弃缓存，只用内置数据，
+        // 再由 refresh() 从 Worker 拉最新数据并按新版本重写缓存。
+        // 这样从 build 4 / build 6 升级上来的旧缓存一定被丢弃，不会再盖住正确数据。
+        let version = try? String(contentsOf: cacheVersionURL, encoding: .utf8)
+        guard version?.trimmingCharacters(in: .whitespacesAndNewlines) == "\(Self.cacheVersion)" else {
+            discardCache()
+            return
+        }
         var loadedAny = false
         for client in MagicRuleClient.all {
             let url = cacheURL(for: client)
@@ -127,6 +153,7 @@ final class MagicRuleStore: ObservableObject {
 
     private func saveCache(client: String, data: Data) {
         try? data.write(to: cacheURL(for: client), options: .atomic)
+        try? "\(Self.cacheVersion)".write(to: cacheVersionURL, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Worker 刷新
