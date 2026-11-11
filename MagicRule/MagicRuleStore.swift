@@ -15,7 +15,7 @@ final class MagicRuleStore: ObservableObject {
         case worker
     }
 
-    static let workerBase = "https://magicrule-crawler.8868.workers.dev"
+    nonisolated static let workerBase = "https://magicrule-crawler.8868.workers.dev"
 
     @Published private(set) var rulesByClient: [String: [MagicRule]] = [:]
     @Published private(set) var generatedAtByClient: [String: Date] = [:]
@@ -28,7 +28,7 @@ final class MagicRuleStore: ObservableObject {
     private let monitorQueue = DispatchQueue(label: "magicrule.network")
     private var hasRefreshed = false
 
-    private static var decoder: JSONDecoder {
+    private nonisolated static var decoder: JSONDecoder {
         let d = JSONDecoder()
         d.keyDecodingStrategy = .convertFromSnakeCase
         return d
