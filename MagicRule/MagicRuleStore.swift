@@ -14,6 +14,14 @@ import Network
 /// - 所有 JSON 解码都在后台线程（Task.detached / 非隔离静态方法），
 ///   @MainActor 的 Store 只持有结果、驱动界面，主线程不做解码。
 /// - Worker 拉回来的 JSON 解码、写缓存的编码也都在后台做。
+///
+/// 性能设计（build 11，解决二级页卡顿）：
+/// - 摘要加载完后立即在后台低优先级预加载全部 11 个客户端的完整规则
+///   （逐个解码，.utility 优先级，不抢主线程和首页交互），
+///   用户点进二级页时数据大多已在内存里，直接出列表，不用等解码。
+/// - 预加载与懒加载共享同一份在途解码任务（inFlightLoads），
+///   同一客户端只解一次：用户在预加载完成前点进去，等正在解的任务完成即可。
+/// - Worker 刷新成功时会覆盖为最新数据，预加载的结果不会盖住它。
 @MainActor
 final class MagicRuleStore: ObservableObject {
     enum Source: Equatable {
@@ -41,6 +49,11 @@ final class MagicRuleStore: ObservableObject {
     @Published private(set) var loadedClients: Set<String> = []
     /// 正在后台解码完整规则的客户端（二级页显示加载中）。
     @Published private(set) var loadingClients: Set<String> = []
+    /// 在途解码任务（预加载与懒加载共享，同一客户端只解一次）。
+    /// key 是客户端名，value 是后台解码该客户端完整索引的任务。
+    private var inFlightLoads: [String: Task<ClientIndex?, Never>] = [:]
+    /// 后台预加载任务（同一时间只跑一个；跑完置 nil，下拉刷新后可再跑一次补缺口）。
+    private var preloadTask: Task<Void, Never>?
 
     private let monitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "magicrule.network")
@@ -118,21 +131,71 @@ final class MagicRuleStore: ObservableObject {
         }.value
         summaries = loaded.summaries
         source = loaded.source
+        // 摘要一就绪就启动后台预加载（与 Worker 刷新并行跑）：
+        // 刷新成功会覆盖为最新数据；刷新失败/离线时，预加载已把内置/缓存数据解进内存，
+        // 用户点进二级页直接出列表，不用等。
+        startPreloadIfNeeded()
         await refreshIfNeeded()
     }
 
-    // MARK: - 按客户端懒加载完整规则
+    // MARK: - 按客户端懒加载完整规则 + 后台预加载（build 11）
 
     /// 进入某客户端二级页时调用：后台解码该客户端的完整规则列表。
-    /// 已加载过直接返回；加载中由 loadingClients 驱动二级页的加载状态。
+    /// 已加载过直接返回；预加载正在解这个客户端时，等它解完即可，不重复解码；
+    /// 否则以 .userInitiated 优先级在后台解码（用户正在等，优先级高于预加载）。
     func ensureRulesLoaded(for client: String) async {
-        if loadedClients.contains(client) || loadingClients.contains(client) { return }
+        if loadedClients.contains(client) { return }
+        if let existing = inFlightLoads[client] {
+            await finishLoad(for: client, task: existing)
+            return
+        }
         loadingClients.insert(client)
-        let index = await Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) {
             Self.loadFullIndex(for: client)
-        }.value
+        }
+        inFlightLoads[client] = task
+        await finishLoad(for: client, task: task)
+    }
+
+    /// 启动后台预加载（只同时跑一个；跑完置 nil，之后下拉刷新可再触发一次补缺口）。
+    /// 触发时机：摘要加载完后（与 Worker 刷新并行）、每次刷新结束时。
+    /// 低优先级（.background 循环 + .utility 解码）、逐个客户端顺序解，
+    /// 不抢主线程和首页交互；全部解完约几秒，用户一般还没点进二级页。
+    private func startPreloadIfNeeded() {
+        guard preloadTask == nil else { return }
+        preloadTask = Task(priority: .background) { [weak self] in
+            guard let self else { return }
+            for client in MagicRuleClient.all {
+                if Task.isCancelled { break }
+                await self.preloadOne(client)
+            }
+            self.preloadTask = nil
+        }
+    }
+
+    /// 预加载某一个客户端：已加载的跳过；在途的等它解完；否则低优先级新起解码任务。
+    private func preloadOne(_ client: String) async {
+        if loadedClients.contains(client) { return }
+        if let existing = inFlightLoads[client] {
+            await finishLoad(for: client, task: existing)
+            return
+        }
+        let task = Task.detached(priority: .utility) {
+            Self.loadFullIndex(for: client)
+        }
+        inFlightLoads[client] = task
+        await finishLoad(for: client, task: task)
+    }
+
+    /// 等一个解码任务完成并把结果发布到主线程。
+    /// 两个调用方可能同时等同一个任务：先完成的发布，后完成的看到
+    /// loadedClients 已包含该客户端就跳过，不会重复发布，也不会盖掉
+    /// Worker 刷新期间已发布的新数据。
+    private func finishLoad(for client: String, task: Task<ClientIndex?, Never>) async {
+        let index = await task.value
+        inFlightLoads[client] = nil
         loadingClients.remove(client)
-        guard let index else { return }
+        guard !loadedClients.contains(client), let index else { return }
         rulesByClient[client] = index.rules
         let date = MagicRule.date(from: index.generatedAt)
         summaries[client] = ClientSummary(
@@ -157,6 +220,9 @@ final class MagicRuleStore: ObservableObject {
         isLoading = true
         notice = nil
         defer { isLoading = false }
+        // 刷新结束（无论成功、部分成功还是全部失败）都触发一次预加载补缺口：
+        // 刷新没拉到的客户端由预加载从内置/缓存解码进内存，二级页点进去直接出列表。
+        defer { startPreloadIfNeeded() }
 
         // 1. 并行拉取（纯网络 I/O，不解码）。
         let fetchedData: [(String, Data)] = await withTaskGroup(of: (String, Data?).self) { group in
