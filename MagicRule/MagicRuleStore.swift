@@ -49,6 +49,13 @@ final class MagicRuleStore: ObservableObject {
     @Published private(set) var loadedClients: Set<String> = []
     /// 正在后台解码完整规则的客户端（二级页显示加载中）。
     @Published private(set) var loadingClients: Set<String> = []
+    /// 启动进度（启动动画用）：0→1，跟真实加载挂钩。
+    /// 摘要就绪 0.1；之后每完成一个客户端的完整规则加载 +0.9/11；加载失败也计入，不会卡住。
+    @Published private(set) var launchProgress: Double = 0
+    /// 启动期已尝试加载完整规则的客户端数（成功或失败都算）。
+    @Published private(set) var launchLoadedCount = 0
+    /// 全部启动数据就绪（可进入首页）。
+    @Published private(set) var isLaunchReady = false
     /// 在途解码任务（预加载与懒加载共享，同一客户端只解一次）。
     /// key 是客户端名，value 是后台解码该客户端完整索引的任务。
     private var inFlightLoads: [String: Task<ClientIndex?, Never>] = [:]
@@ -70,8 +77,9 @@ final class MagicRuleStore: ObservableObject {
             Task { @MainActor in self?.isOffline = path.status != .satisfied }
         }
         monitor.start(queue: monitorQueue)
-        // 启动不堵界面：摘要在后台解，解完回主线程发布；首页先出骨架。
-        Task { await loadSummariesAndRefresh() }
+        // 启动不堵界面：启动序列在后台加载全部数据（摘要 + 11 个客户端完整规则），
+        // 进度实时发布，启动页显示进度条；到 100% 再进首页。
+        Task { await runLaunchSequence() }
     }
 
     // MARK: - 派生状态
@@ -123,18 +131,35 @@ final class MagicRuleStore: ObservableObject {
         return sourceText
     }
 
-    // MARK: - 启动：后台加载摘要，再触发 Worker 刷新
+    /// 启动页状态文案：摘要阶段 / 正在加载规则 x/11 / 加载完成。
+    var launchStatusText: String {
+        if launchProgress < 0.1 { return "正在加载摘要…" }
+        if launchLoadedCount < MagicRuleClient.all.count {
+            return "正在加载规则… \(launchLoadedCount)/\(MagicRuleClient.all.count)"
+        }
+        return "加载完成"
+    }
 
-    private func loadSummariesAndRefresh() async {
+    // MARK: - 启动：后台加载全部数据，进度真实挂钩（build 15）
+
+    /// 启动序列：摘要（0→0.1）→ 11 个客户端完整规则（0.1→1.0，每完成一个 +0.9/11，
+    /// 失败也计入，不会卡在 99%）→ 进度到 100% 进入首页；Worker 刷新在进入首页后
+    /// 后台继续跑，不堵启动。全部解码在后台线程，主线程只发布进度。
+    private func runLaunchSequence() async {
         let loaded = await Task.detached(priority: .userInitiated) {
             await Self.loadSummariesFromDisk()
         }.value
         summaries = loaded.summaries
         source = loaded.source
-        // 摘要一就绪就启动后台预加载（与 Worker 刷新并行跑）：
-        // 刷新成功会覆盖为最新数据；刷新失败/离线时，预加载已把内置/缓存数据解进内存，
-        // 用户点进二级页直接出列表，不用等。
-        startPreloadIfNeeded()
+        launchProgress = 0.1
+        for client in MagicRuleClient.all {
+            await preloadOne(client)
+            launchLoadedCount += 1
+            launchProgress = 0.1 + 0.9 * Double(launchLoadedCount) / Double(MagicRuleClient.all.count)
+        }
+        launchProgress = 1.0
+        isLaunchReady = true
+        // 进入首页后，后台拉 Worker 最新数据（不堵启动）。
         await refreshIfNeeded()
     }
 

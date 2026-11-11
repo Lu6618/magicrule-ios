@@ -34,6 +34,7 @@
 		000000000000000000001041 = {isa = PBXBuildFile; fileRef = 000000000000000000001040; };
 		000000000000000000001043 = {isa = PBXBuildFile; fileRef = 000000000000000000001042; };
 		000000000000000000001045 = {isa = PBXBuildFile; fileRef = 000000000000000000001044; };
+		000000000000000000001048 = {isa = PBXBuildFile; fileRef = 000000000000000000001047; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -66,6 +67,7 @@
 		000000000000000000001042 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Surfboard.png; sourceTree = "<group>"; };
 		000000000000000000001044 = {isa = PBXFileReference; lastKnownFileType = image.png; path = Surge.png; sourceTree = "<group>"; };
 		000000000000000000001046 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		000000000000000000001047 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuleIconLoader.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -118,6 +120,7 @@
 				000000000000000000001042,
 				000000000000000000001044,
 				000000000000000000001046,
+				000000000000000000001047,
 			);
 			path = MagicRule;
 			sourceTree = "<group>";
@@ -225,6 +228,7 @@
 				000000000000000000001005,
 				000000000000000000001007,
 				000000000000000000001009,
+				000000000000000000001048,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

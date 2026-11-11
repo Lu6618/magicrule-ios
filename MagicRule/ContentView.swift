@@ -227,7 +227,8 @@ enum RuleImport {
 
 /// 首页：只用来选代理工具。点进一个客户端后进入二级页查看/搜索规则。
 struct ContentView: View {
-    @StateObject private var store = MagicRuleStore()
+    // Store 由 MagicRuleApp 创建并传入（启动页和首页共用同一个）。
+    @ObservedObject var store: MagicRuleStore
     @State private var toast: String?
 
     private var columns: [GridItem] {
@@ -239,7 +240,6 @@ struct ContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     brandRow
-                    overviewStats
                     clientGrid
                     if let notice = store.notice {
                         Text(notice)
@@ -264,9 +264,6 @@ struct ContentView: View {
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: String.self) { client in
                 ClientRulesView(client: client, store: store, onToast: { toast = $0 })
-            }
-            .task {
-                await store.refreshIfNeeded()
             }
         }
         // Toast 挂在 NavigationStack 这一层，二级页/详情页里也能看到。
@@ -331,18 +328,6 @@ struct ContentView: View {
         .padding(.horizontal, 20)
     }
 
-    // MARK: - 总览统计
-
-    private var overviewStats: some View {
-        HStack(spacing: 12) {
-            // 摘要还在后台加载时显示占位，解完立刻填数。
-            StatCard(value: store.summaries.isEmpty ? "…" : CountFormat.plain(store.totalRuleCount), label: "规则", accent: false)
-            StatCard(value: "\(MagicRuleClient.all.count)", label: "客户端", accent: true)
-            StatCard(value: store.summaries.isEmpty ? "加载中" : RelativeFormat.string(from: store.latestGeneratedAt), label: "最近更新", accent: false)
-        }
-        .padding(.horizontal, 20)
-    }
-
     // MARK: - 客户端网格
 
     private var clientGrid: some View {
@@ -354,10 +339,7 @@ struct ContentView: View {
             LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(MagicRuleClient.all, id: \.self) { client in
                     NavigationLink(value: client) {
-                        ClientCard(
-                            client: client,
-                            summary: store.summary(for: client)
-                        )
+                        ClientCard(client: client)
                     }
                     .buttonStyle(.plain)
                 }
@@ -367,11 +349,10 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 客户端卡片（首页）
+// MARK: - 客户端卡片（首页：只留图标 + 名字 + 右箭头）
 
 private struct ClientCard: View {
     let client: String
-    let summary: ClientSummary?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -388,13 +369,6 @@ private struct ClientCard: View {
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
-            Text(summary == nil ? "加载中…" : "\(CountFormat.plain(summary!.ruleCount)) 条规则")
-                .font(.subheadline)
-                .foregroundStyle(Theme.secondary)
-            Text(summary == nil ? "" : "更新于 \(RelativeFormat.string(from: summary!.generatedAt))")
-                .font(.caption)
-                .foregroundStyle(Theme.tertiary)
-                .lineLimit(1)
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -651,7 +625,9 @@ private struct RuleRowCard: View {
                         .lineLimit(1)
                 }
                 HStack(spacing: 6) {
-                    ForEach(rule.types.prefix(2), id: \.self) { type in
+                    // 详情行永远只有一行：只显示第一个类型标签（再多就放不下），
+                    // 徽标/药丸单行不换行，日期不够宽时截断，绝不挤成两三排。
+                    ForEach(rule.types.prefix(1), id: \.self) { type in
                         TypeBadge(text: type)
                     }
                     CountPill(text: "共 \(CountFormat.plain(rule.totalLineCount)) 条")
@@ -737,30 +713,29 @@ struct ClientIconView: View {
     }
 }
 
-// MARK: - 规则图标（异步加载 + 磁盘缓存，失败时显示名字首字占位）
-
+// MARK: - 规则图标（RuleIconLoader 加载 + 内存/磁盘缓存，失败重试一次）
+//
+// 加载中显示浅色占位（无字母），与“失败回退的首字母占位”区分开；
+// 下载任务由加载器持有，视图重建/滚动不会取消下载，失败自动重试一次。
 struct RuleIconView: View {
     let urlString: String?
     let size: CGFloat
     var label: String? = nil
 
+    @State private var image: UIImage?
+    @State private var failed = false
+
     var body: some View {
         Group {
-            if let urlString, let url = URL(string: urlString) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    case .failure, .empty:
-                        fallback
-                    @unknown default:
-                        fallback
-                    }
-                }
-            } else {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if failed {
                 fallback
+            } else {
+                RoundedRectangle(cornerRadius: size * 0.24)
+                    .fill(Theme.accentSoft)
             }
         }
         .frame(width: size, height: size)
@@ -768,6 +743,19 @@ struct RuleIconView: View {
         .overlay {
             RoundedRectangle(cornerRadius: size * 0.24)
                 .stroke(Theme.cardStroke, lineWidth: 1)
+        }
+        .task(id: urlString) {
+            image = nil
+            failed = false
+            guard let urlString else {
+                failed = true
+                return
+            }
+            if let img = await RuleIconLoader.shared.image(for: urlString) {
+                image = img
+            } else {
+                failed = true
+            }
         }
     }
 
@@ -1072,12 +1060,15 @@ private struct LinkRow: View {
 }
 
 /// 类型徽标：米色药丸 + 等宽字体（对齐 MagicRule 网页版）。
+/// 单行不换行：文字不压缩、不换行，空间不够时由同行的日期截断，徽标本身保持完整。
 private struct TypeBadge: View {
     let text: String
 
     var body: some View {
         Text(text)
             .font(.system(.caption2, design: .monospaced).weight(.semibold))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(Theme.badgeBg, in: Capsule())
@@ -1085,13 +1076,15 @@ private struct TypeBadge: View {
     }
 }
 
-/// “共 X 条”琥珀药丸。
+/// “共 X 条”琥珀药丸。单行不换行。
 private struct CountPill: View {
     let text: String
 
     var body: some View {
         Text(text)
             .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(Theme.accentSoft, in: Capsule())
