@@ -1,8 +1,81 @@
 import SwiftUI
 import UIKit
 
-/// 首页：客户端切换 + 搜索 + 规则列表。
-/// 设计：渐变头图、横向滚动客户端药丸、圆角卡片、语义色，亮暗模式都好看。
+// MARK: - 设计语言：MagicRule 网页版（暖米色底 + 琥珀橙主色 + 白圆角卡片）
+// 浅色：暖米底 #FAF6EC、白卡片、琥珀橙；深色：暖炭底 + 暖棕卡片 + 亮琥珀。
+enum Theme {
+    private static func dyn(_ light: UIColor, _ dark: UIColor) -> Color {
+        Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? dark : light })
+    }
+
+    static let bg = dyn(
+        UIColor(red: 0.980, green: 0.965, blue: 0.925, alpha: 1),
+        UIColor(red: 0.090, green: 0.075, blue: 0.055, alpha: 1)
+    )
+    static let card = dyn(
+        .white,
+        UIColor(red: 0.150, green: 0.125, blue: 0.105, alpha: 1)
+    )
+    static let cardStroke = dyn(
+        UIColor(red: 0.930, green: 0.895, blue: 0.830, alpha: 1),
+        UIColor(red: 0.235, green: 0.205, blue: 0.155, alpha: 1)
+    )
+    static let text = dyn(
+        UIColor(red: 0.115, green: 0.095, blue: 0.070, alpha: 1),
+        UIColor(red: 0.957, green: 0.933, blue: 0.890, alpha: 1)
+    )
+    static let secondary = dyn(
+        UIColor(red: 0.540, green: 0.500, blue: 0.435, alpha: 1),
+        UIColor(red: 0.660, green: 0.620, blue: 0.545, alpha: 1)
+    )
+    static let tertiary = dyn(
+        UIColor(red: 0.705, green: 0.665, blue: 0.585, alpha: 1),
+        UIColor(red: 0.480, green: 0.445, blue: 0.385, alpha: 1)
+    )
+    /// 琥珀主色（文字 / 图标用）
+    static let accent = dyn(
+        UIColor(red: 0.790, green: 0.540, blue: 0.025, alpha: 1),
+        UIColor(red: 0.913, green: 0.663, blue: 0.230, alpha: 1)
+    )
+    /// 琥珀浅底（药丸、图标底）
+    static let accentSoft = dyn(
+        UIColor(red: 0.968, green: 0.913, blue: 0.775, alpha: 1),
+        UIColor(red: 0.240, green: 0.185, blue: 0.095, alpha: 1)
+    )
+    /// 类型徽标底 / 字
+    static let badgeBg = dyn(
+        UIColor(red: 0.953, green: 0.918, blue: 0.840, alpha: 1),
+        UIColor(red: 0.220, green: 0.190, blue: 0.120, alpha: 1)
+    )
+    static let badgeText = dyn(
+        UIColor(red: 0.480, green: 0.360, blue: 0.055, alpha: 1),
+        UIColor(red: 0.913, green: 0.790, blue: 0.475, alpha: 1)
+    )
+    /// 琥珀渐变（选中药丸、Logo 底、主按钮）
+    static let amberGradient = LinearGradient(
+        colors: [Color(red: 0.93, green: 0.65, blue: 0.15), Color(red: 0.80, green: 0.49, blue: 0.03)],
+        startPoint: .topLeading, endPoint: .bottomTrailing
+    )
+}
+
+// MARK: - 相对时间：4 小时前 / 昨天 / 3 天前 / 1 个月前
+enum RelativeFormat {
+    static func string(from date: Date?) -> String {
+        guard let date else { return "未知" }
+        let seconds = Date().timeIntervalSince(date)
+        if seconds < 60 { return "刚刚" }
+        if seconds < 3600 { return "\(Int(seconds / 60)) 分钟前" }
+        if seconds < 86400 { return "\(Int(seconds / 3600)) 小时前" }
+        let days = Int(seconds / 86400)
+        if days == 1 { return "昨天" }
+        if days < 30 { return "\(days) 天前" }
+        let months = days / 30
+        if months < 12 { return "\(months) 个月前" }
+        return "\(months / 12) 年前"
+    }
+}
+
+/// 首页：品牌行 + 客户端头 + 统计卡 + 客户端切换 + 搜索 + 规则列表。
 struct ContentView: View {
     @StateObject private var store = MagicRuleStore()
     @State private var selectedClient: String? = "QuantumultX"
@@ -14,46 +87,56 @@ struct ContentView: View {
         store.search(query, scope: selectedClient)
     }
 
+    /// 当前选中客户端（或全部）的全部规则（不受搜索过滤）。
+    private var currentRules: [MagicRule] {
+        if let selectedClient {
+            return store.rules(for: selectedClient)
+        }
+        return MagicRuleClient.all.flatMap { store.rules(for: $0) }
+    }
+
+    private var distinctTypeCount: Int {
+        Set(currentRules.flatMap { $0.types }).count
+    }
+
+    private var latestUpdate: Date? {
+        if let selectedClient {
+            return store.generatedAt(for: selectedClient)
+        }
+        return store.latestGeneratedAt
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    headerCard
+                VStack(alignment: .leading, spacing: 18) {
+                    brandRow
+                    clientHeader
+                    statCards
                     clientPicker
                     searchBar
                     if let notice = store.notice {
                         Text(notice)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.secondary)
                             .padding(.horizontal, 20)
                     }
                     if store.isOffline {
                         Label("当前离线：显示缓存或内置数据", systemImage: "wifi.slash")
                             .font(.caption)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(Theme.accent)
                             .padding(.horizontal, 20)
                     }
                     resultList
                 }
                 .padding(.bottom, 24)
+                .padding(.top, 6)
             }
-            .background(Color(.systemGroupedBackground))
+            .background(Theme.bg.ignoresSafeArea())
             .refreshable {
                 await store.refresh(force: true)
             }
-            .navigationTitle("MagicRule")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task { await store.refresh(force: true) }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .disabled(store.isLoading)
-                    .accessibilityLabel("刷新数据")
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .overlay(alignment: .bottom) {
                 if let toast {
                     ToastView(text: toast)
@@ -73,53 +156,96 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 头图
+    // MARK: - 品牌行
 
-    private var headerCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14)
-                        .fill(.white.opacity(0.22))
-                        .frame(width: 52, height: 52)
-                    Image(systemName: "list.bullet.rectangle.portrait.fill")
-                        .font(.title2)
-                        .foregroundStyle(.white)
-                }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("规则索引浏览器")
-                        .font(.title3.bold())
-                        .foregroundStyle(.white)
-                    Text("11 个客户端 · \(CountFormat.plain(store.totalRuleCount)) 条规则")
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.85))
-                }
-                Spacer()
-                if store.isLoading {
-                    ProgressView()
-                        .tint(.white)
-                }
+    private var brandRow: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Theme.amberGradient)
+                    .frame(width: 36, height: 36)
+                Image(systemName: "cube.fill")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
             }
-            HStack(spacing: 6) {
-                Image(systemName: "arrow.down.circle")
-                    .font(.caption)
-                Text(store.updatedText)
-                    .font(.caption)
+            HStack(spacing: 0) {
+                Text("Magic")
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundStyle(Theme.text)
+                Text("Rule")
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundStyle(Theme.accent)
             }
-            .foregroundStyle(.white.opacity(0.85))
+            Spacer()
+            if store.isLoading {
+                ProgressView()
+                    .frame(width: 38, height: 38)
+                    .background(Theme.card, in: Circle())
+                    .overlay(Circle().stroke(Theme.cardStroke, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.05), radius: 6, y: 2)
+            } else {
+                Button {
+                    Task { await store.refresh(force: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 38, height: 38)
+                        .background(Theme.card, in: Circle())
+                        .overlay(Circle().stroke(Theme.cardStroke, lineWidth: 1))
+                        .shadow(color: .black.opacity(0.05), radius: 6, y: 2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("刷新数据")
+            }
         }
-        .padding(18)
-        .background(
-            LinearGradient(
-                colors: [Color.indigo, Color.purple, Color.pink.opacity(0.85)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            ),
-            in: RoundedRectangle(cornerRadius: 20)
-        )
-        .shadow(color: .indigo.opacity(0.25), radius: 12, y: 4)
         .padding(.horizontal, 20)
-        .padding(.top, 4)
+    }
+
+    // MARK: - 客户端头
+
+    private var clientHeader: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Theme.accentSoft)
+                    .frame(width: 56, height: 56)
+                if let client = selectedClient {
+                    Text(String(client.prefix(1)))
+                        .font(.system(size: 26, weight: .bold))
+                        .foregroundStyle(Theme.accent)
+                } else {
+                    Image(systemName: "square.grid.2x2")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(selectedClient ?? "全部规则")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Text(selectedClient == nil
+                     ? "11 个客户端 · \(CountFormat.plain(store.totalRuleCount)) 条规则"
+                     : "客户端 · \(CountFormat.plain(currentRules.count)) 条规则")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+    }
+
+    // MARK: - 统计卡
+
+    private var statCards: some View {
+        HStack(spacing: 12) {
+            StatCard(value: CountFormat.plain(currentRules.count), label: "规则", accent: false)
+            StatCard(value: "\(distinctTypeCount)", label: "规则类型", accent: true)
+            StatCard(value: RelativeFormat.string(from: latestUpdate), label: "最近更新", accent: false)
+        }
+        .padding(.horizontal, 20)
     }
 
     // MARK: - 客户端选择器
@@ -153,19 +279,20 @@ struct ContentView: View {
                     .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(
-                        (selected ? Color.white.opacity(0.25) : Color.secondary.opacity(0.15)),
-                        in: Capsule()
-                    )
+                    .background(selected ? Color.white.opacity(0.25) : Theme.badgeBg, in: Capsule())
+                    .foregroundStyle(selected ? .white : Theme.badgeText)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
-            .background(
-                selected ? Color.accentColor : Color(.secondarySystemBackground),
-                in: Capsule()
-            )
-            .foregroundStyle(selected ? .white : .primary)
-            .shadow(color: .black.opacity(selected ? 0.12 : 0.03), radius: 6, y: 2)
+            .foregroundStyle(selected ? .white : Theme.text)
+            .background {
+                if selected {
+                    Capsule().fill(Theme.amberGradient)
+                } else {
+                    Capsule().fill(Theme.card).stroke(Theme.cardStroke, lineWidth: 1)
+                }
+            }
+            .shadow(color: .black.opacity(selected ? 0.14 : 0.04), radius: selected ? 8 : 5, y: 2)
         }
         .buttonStyle(.plain)
     }
@@ -176,7 +303,7 @@ struct ContentView: View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
                 .font(.body.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.accent)
             TextField("搜索规则名或中文名，例如：抖音、去广告", text: $query)
                 .focused($searchFocused)
                 .submitLabel(.search)
@@ -187,18 +314,19 @@ struct ContentView: View {
                     query = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.tertiary)
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 14)
-        .frame(height: 52)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 16)
+        .frame(height: 54)
+        .background(Theme.card, in: Capsule())
         .overlay {
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.accentColor.opacity(searchFocused ? 0.5 : 0), lineWidth: 2)
+            Capsule()
+                .stroke(searchFocused ? Theme.accent.opacity(0.6) : Theme.cardStroke, lineWidth: searchFocused ? 1.5 : 1)
         }
+        .shadow(color: .black.opacity(0.05), radius: 8, y: 3)
         .padding(.horizontal, 20)
         .animation(.easeInOut(duration: 0.2), value: searchFocused)
     }
@@ -210,28 +338,35 @@ struct ContentView: View {
             HStack {
                 Text(query.isEmpty ? "全部规则" : "搜索结果")
                     .font(.headline)
+                    .foregroundStyle(Theme.text)
                 Text("\(results.count) 条")
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.secondary)
                 Spacer()
                 if selectedClient == nil {
                     Text("跨客户端")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.secondary)
                 }
             }
             .padding(.horizontal, 20)
 
             if results.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass.circle")
-                        .font(.system(size: 56))
-                        .foregroundStyle(.tertiary)
+                VStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Theme.accentSoft)
+                            .frame(width: 88, height: 88)
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 30, weight: .medium))
+                            .foregroundStyle(Theme.accent)
+                    }
                     Text("没有找到相关规则")
                         .font(.headline)
+                        .foregroundStyle(Theme.text)
                     Text("换个关键词试试")
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.secondary)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 48)
@@ -253,6 +388,32 @@ struct ContentView: View {
     }
 }
 
+// MARK: - 统计卡
+
+private struct StatCard: View {
+    let value: String
+    let label: String
+    let accent: Bool
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value)
+                .font(.system(size: 19, weight: .bold))
+                .foregroundStyle(accent ? Theme.accent : Theme.text)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(Theme.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 14)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.cardStroke, lineWidth: 1))
+        .shadow(color: .black.opacity(0.05), radius: 8, y: 3)
+    }
+}
+
 // MARK: - 规则卡片
 
 private struct RuleRowCard: View {
@@ -261,49 +422,51 @@ private struct RuleRowCard: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            RuleIconView(urlString: rule.iconURL, size: 48)
+            RuleIconView(urlString: rule.iconURL, size: 52)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
                     Text(rule.displayName)
                         .font(.headline)
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(Theme.text)
                         .lineLimit(1)
                     if rule.hasSeparateChineseName {
                         Text(rule.name)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.secondary)
                             .lineLimit(1)
                     }
                 }
                 if let desc = rule.description, !desc.isEmpty {
                     Text(desc)
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.secondary)
                         .lineLimit(1)
                 }
                 HStack(spacing: 6) {
                     ForEach(rule.types.prefix(2), id: \.self) { type in
-                        Badge(text: type, tint: .indigo)
+                        TypeBadge(text: type)
                     }
-                    Text(CountFormat.lines(rule.totalLineCount))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("·")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    CountPill(text: "共 \(CountFormat.plain(rule.totalLineCount)) 条")
                     Text(DateFormat.short(rule.updatedDate))
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.tertiary)
+                        .lineLimit(1)
                 }
             }
             Spacer()
-            Image(systemName: "chevron.right")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.tertiary)
+            ZStack {
+                Circle()
+                    .fill(Theme.accentSoft)
+                    .frame(width: 28, height: 28)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.secondary)
+            }
         }
         .padding(16)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
-        .shadow(color: .black.opacity(0.04), radius: 8, y: 2)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Theme.cardStroke, lineWidth: 1))
+        .shadow(color: .black.opacity(0.05), radius: 10, y: 3)
     }
 }
 
@@ -336,17 +499,17 @@ struct RuleIconView: View {
         .clipShape(RoundedRectangle(cornerRadius: size * 0.24))
         .overlay {
             RoundedRectangle(cornerRadius: size * 0.24)
-                .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+                .stroke(Theme.cardStroke, lineWidth: 1)
         }
     }
 
     private var fallback: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12)
-                .fill(Color.indigo.opacity(0.14))
+                .fill(Theme.accentSoft)
             Image(systemName: "globe")
                 .font(.body)
-                .foregroundStyle(.indigo)
+                .foregroundStyle(Theme.accent)
         }
     }
 }
@@ -375,15 +538,16 @@ struct RuleDetailView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text(rule.displayName)
                             .font(.title2.bold())
+                            .foregroundStyle(Theme.text)
                             .lineLimit(2)
                         if rule.hasSeparateChineseName {
                             Text(rule.name)
                                 .font(.subheadline)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(Theme.secondary)
                         }
                         HStack(spacing: 6) {
                             ForEach(rule.types, id: \.self) { type in
-                                Badge(text: type, tint: .indigo)
+                                TypeBadge(text: type)
                             }
                         }
                     }
@@ -392,16 +556,21 @@ struct RuleDetailView: View {
 
                 // 描述
                 if let desc = rule.description, !desc.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 10) {
                         SectionTitle("简介")
                         Text(desc)
                             .font(.body)
-                            .foregroundStyle(.primary)
+                            .foregroundStyle(Theme.text)
                     }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.cardStroke, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
                 }
 
                 // 统计
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 10) {
                     SectionTitle("统计")
                     HStack(spacing: 12) {
                         StatBox(title: "总行数", value: CountFormat.plain(rule.totalLineCount), icon: "list.number")
@@ -419,14 +588,16 @@ struct RuleDetailView: View {
                         }
                     }
                     .padding(14)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.cardStroke, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
                     HStack(spacing: 6) {
                         Image(systemName: "clock")
                             .font(.caption)
                         Text("规则更新于 \(DateFormat.full(rule.updatedDate))")
                             .font(.caption)
                     }
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.secondary)
                 }
 
                 // 操作
@@ -441,7 +612,7 @@ struct RuleDetailView: View {
                             .frame(maxWidth: .infinity, minHeight: 48)
                     }
                     .buttonStyle(.plain)
-                    .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 13))
+                    .background(Theme.amberGradient, in: RoundedRectangle(cornerRadius: 14))
                     .foregroundStyle(.white)
                     .font(.body.weight(.semibold))
                     .disabled(shareURL == nil)
@@ -453,15 +624,15 @@ struct RuleDetailView: View {
                                 .padding(.horizontal, 16)
                         }
                         .buttonStyle(.plain)
-                        .background(Color.accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 13))
-                        .foregroundStyle(Color.accentColor)
+                        .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(Theme.accent)
                         .font(.body.weight(.semibold))
                     }
                 }
 
                 // manifest
                 if let manifestURL {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 10) {
                         SectionTitle("Manifest")
                         LinkRow(title: "manifest.json", url: manifestURL, onToast: onToast)
                     }
@@ -469,7 +640,7 @@ struct RuleDetailView: View {
 
                 // 上游 provider
                 if !rule.providers.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 10) {
                         SectionTitle("上游来源（\(rule.providers.count)）")
                         VStack(spacing: 8) {
                             ForEach(rule.providers, id: \.self) { provider in
@@ -485,7 +656,7 @@ struct RuleDetailView: View {
             .padding(.top, 8)
             .padding(.bottom, 28)
         }
-        .background(Color(.systemGroupedBackground))
+        .background(Theme.bg.ignoresSafeArea())
         .navigationTitle(rule.displayName)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -499,8 +670,14 @@ private struct SectionTitle: View {
     init(_ text: String) { self.text = text }
 
     var body: some View {
-        Text(text)
-            .font(.headline)
+        HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(Theme.accent)
+                .frame(width: 4, height: 16)
+            Text(text)
+                .font(.headline)
+                .foregroundStyle(Theme.text)
+        }
     }
 }
 
@@ -513,19 +690,21 @@ private struct StatBox: View {
         VStack(alignment: .leading, spacing: 6) {
             Image(systemName: icon)
                 .font(.body)
-                .foregroundStyle(.indigo)
+                .foregroundStyle(Theme.accent)
             Text(value)
                 .font(.headline)
+                .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             Text(title)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
-        .shadow(color: .black.opacity(0.03), radius: 6, y: 2)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.cardStroke, lineWidth: 1))
+        .shadow(color: .black.opacity(0.04), radius: 6, y: 2)
     }
 }
 
@@ -539,18 +718,19 @@ private struct TypeCountRow: View {
             HStack {
                 Text(type)
                     .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Theme.text)
                 Spacer()
                 Text(CountFormat.plain(count))
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.secondary)
             }
             GeometryReader { geo in
                 Capsule()
-                    .fill(Color.indigo.opacity(0.18))
+                    .fill(Theme.accent.opacity(0.18))
                     .frame(height: 6)
                     .overlay(alignment: .leading) {
                         Capsule()
-                            .fill(Color.indigo)
+                            .fill(Theme.accent)
                             .frame(width: max(6, geo.size.width * fraction), height: 6)
                     }
             }
@@ -570,15 +750,15 @@ private struct LinkRow: View {
                 HStack(spacing: 10) {
                     Image(systemName: "link")
                         .font(.caption)
-                        .foregroundStyle(.indigo)
+                        .foregroundStyle(Theme.accent)
                     Text(title)
                         .font(.subheadline)
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(Theme.text)
                         .lineLimit(2)
                     Spacer()
                     Image(systemName: "arrow.up.forward.app")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(Theme.tertiary)
                 }
             }
             Button {
@@ -587,27 +767,42 @@ private struct LinkRow: View {
             } label: {
                 Image(systemName: "doc.on.doc")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.secondary)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("复制链接")
         }
         .padding(14)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.cardStroke, lineWidth: 1))
     }
 }
 
-private struct Badge: View {
+/// 类型徽标：米色药丸 + 等宽字体（对齐 MagicRule 网页版）。
+private struct TypeBadge: View {
     let text: String
-    let tint: Color
+
+    var body: some View {
+        Text(text)
+            .font(.system(.caption2, design: .monospaced).weight(.semibold))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Theme.badgeBg, in: Capsule())
+            .foregroundStyle(Theme.badgeText)
+    }
+}
+
+/// “共 X 条”琥珀药丸。
+private struct CountPill: View {
+    let text: String
 
     var body: some View {
         Text(text)
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(tint.opacity(0.14), in: Capsule())
-            .foregroundStyle(tint)
+            .background(Theme.accentSoft, in: Capsule())
+            .foregroundStyle(Theme.accent)
     }
 }
 

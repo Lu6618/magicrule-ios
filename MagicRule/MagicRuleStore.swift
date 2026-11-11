@@ -58,6 +58,11 @@ final class MagicRuleStore: ObservableObject {
         generatedAtByClient.values.max()
     }
 
+    /// 某个客户端索引的生成时间。
+    func generatedAt(for client: String) -> Date? {
+        generatedAtByClient[client]
+    }
+
     var sourceText: String {
         switch source {
         case .bundled: return "内置数据"
