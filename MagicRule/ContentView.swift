@@ -847,6 +847,8 @@ struct RuleDetailView: View {
     let onToast: (String) -> Void
 
     @State private var isImporting = false
+    @State private var isManifestExpanded = false
+    @State private var isProvidersExpanded = false
 
     private var manifestURL: URL? {
         guard let m = rule.manifest else { return nil }
@@ -873,9 +875,12 @@ struct RuleDetailView: View {
                                 .font(.subheadline)
                                 .foregroundStyle(Theme.secondary)
                         }
-                        HStack(spacing: 6) {
-                            ForEach(rule.types, id: \.self) { type in
-                                TypeBadge(text: type)
+                        // 类型标签：横向滚动，不撑宽父视图（之前一排 fixedSize 标签把整页内容撑出屏幕，导致统计卡、条形图等被横向截断）。
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(rule.types, id: \.self) { type in
+                                    TypeBadge(text: type)
+                                }
                             }
                         }
                     }
@@ -935,7 +940,7 @@ struct RuleDetailView: View {
                             onToast(Clipboard.copy(url.absoluteString) ? "链接已复制" : "复制失败，请重试")
                         }
                     } label: {
-                        Label("复制规则链接", systemImage: "doc.on.doc")
+                        Label("复制链接", systemImage: "doc.on.doc")
                             .frame(maxWidth: .infinity, minHeight: 48)
                     }
                     .buttonStyle(.plain)
@@ -955,12 +960,10 @@ struct RuleDetailView: View {
                     } label: {
                         if isImporting {
                             ProgressView()
-                                .frame(minHeight: 48)
-                                .padding(.horizontal, 16)
+                                .frame(maxWidth: .infinity, minHeight: 48)
                         } else {
                             Label("一键导入", systemImage: "square.and.arrow.down")
-                                .frame(minHeight: 48)
-                                .padding(.horizontal, 16)
+                                .frame(maxWidth: .infinity, minHeight: 48)
                         }
                     }
                     .buttonStyle(.plain)
@@ -975,18 +978,16 @@ struct RuleDetailView: View {
                         .foregroundStyle(Theme.secondary)
                 }
 
-                // manifest
+                // manifest（默认收起，点一下展开）
                 if let manifestURL {
-                    VStack(alignment: .leading, spacing: 10) {
-                        SectionTitle("Manifest")
+                    DisclosureCard(title: "Manifest", countText: nil, isExpanded: $isManifestExpanded) {
                         LinkRow(title: "manifest.json", url: manifestURL, onToast: onToast)
                     }
                 }
 
-                // 上游 provider
+                // 上游来源（默认收起，点一下展开）
                 if !rule.providers.isEmpty {
-                    VStack(alignment: .leading, spacing: 10) {
-                        SectionTitle("上游来源（\(rule.providers.count)）")
+                    DisclosureCard(title: "上游来源", countText: "\(rule.providers.count) 个", isExpanded: $isProvidersExpanded) {
                         VStack(spacing: 8) {
                             ForEach(rule.providers, id: \.self) { provider in
                                 if let url = URL(string: provider) {
@@ -1023,6 +1024,59 @@ private struct SectionTitle: View {
                 .font(.headline)
                 .foregroundStyle(Theme.text)
         }
+    }
+}
+
+/// 可折叠的卡片：按钮式折叠头（标题 + 数量 + 箭头），默认收起，点一下展开/收起。
+/// 用于详情页的 Manifest 和上游来源两节。
+private struct DisclosureCard<Content: View>: View {
+    let title: String
+    let countText: String?
+    @Binding var isExpanded: Bool
+    let content: Content
+
+    init(title: String, countText: String?, isExpanded: Binding<Bool>, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.countText = countText
+        self._isExpanded = isExpanded
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(title)
+                        .font(.headline)
+                        .foregroundStyle(Theme.text)
+                    if let countText = countText {
+                        Text(countText)
+                            .font(.subheadline)
+                            .foregroundStyle(Theme.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .padding(16)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if isExpanded {
+                content
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+            }
+        }
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.cardStroke, lineWidth: 1))
+        .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
     }
 }
 
@@ -1064,10 +1118,12 @@ private struct TypeCountRow: View {
                 Text(type)
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Theme.text)
+                    .lineLimit(1)
                 Spacer()
                 Text(CountFormat.plain(count))
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
             }
             GeometryReader { geo in
                 Capsule()
