@@ -1022,7 +1022,7 @@ struct RuleDetailView: View {
         }
     }
 
-    /// 单个“复制链接 + 一键导入”按钮（兜底：manifest 拉不到或没有 artifacts 时用）。
+    /// 单个“复制链接 + 一键导入”按钮（兜底：manifest 拉不到或没有 artifacts 时用；不支持一键导入的客户端只显示“复制链接”，占满整行）。
     private var singleActionButtons: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
@@ -1040,39 +1040,36 @@ struct RuleDetailView: View {
                 .font(.body.weight(.semibold))
                 .disabled(shareURL == nil)
 
-                Button {
-                    guard !isImporting else { return }
-                    isImporting = true
-                    Task {
-                        let message = await RuleImport.attemptImport(client: client, rule: rule)
-                        onToast(message)
-                        isImporting = false
+                if RuleImport.supportsImport(client: client) {
+                    Button {
+                        guard !isImporting else { return }
+                        isImporting = true
+                        Task {
+                            let message = await RuleImport.attemptImport(client: client, rule: rule)
+                            onToast(message)
+                            isImporting = false
+                        }
+                    } label: {
+                        if isImporting {
+                            ProgressView()
+                                .frame(maxWidth: .infinity, minHeight: 48)
+                        } else {
+                            Label("一键导入", systemImage: "square.and.arrow.down")
+                                .frame(maxWidth: .infinity, minHeight: 48)
+                        }
                     }
-                } label: {
-                    if isImporting {
-                        ProgressView()
-                            .frame(maxWidth: .infinity, minHeight: 48)
-                    } else {
-                        Label("一键导入", systemImage: "square.and.arrow.down")
-                            .frame(maxWidth: .infinity, minHeight: 48)
-                    }
+                    .buttonStyle(.plain)
+                    .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 14))
+                    .foregroundStyle(Theme.accent)
+                    .font(.body.weight(.semibold))
+                    .disabled(shareURL == nil)
                 }
-                .buttonStyle(.plain)
-                .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 14))
-                .foregroundStyle(Theme.accent)
-                .font(.body.weight(.semibold))
-                .disabled(shareURL == nil)
-            }
-            if !RuleImport.supportsImport(client: client) {
-                Text("当前客户端暂不支持一键导入，点击将复制规则链接，请在 \(client) 内手动添加。")
-                    .font(.caption)
-                    .foregroundStyle(Theme.secondary)
             }
         }
     }
 
     /// 规则订阅列表：每行一个 artifact，左边是 label（推荐的加“推荐”标签），
-    /// 右边是“复制”和“导入”两个小按钮，各管各的文件。
+    /// 右边是“复制”按钮；支持一键导入的客户端（QX、Loon）再加一个“导入”按钮，各管各的文件。
     private func subscriptionList(_ artifacts: [RuleArtifact]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionTitle("规则订阅")
@@ -1102,39 +1099,36 @@ struct RuleDetailView: View {
                         .buttonStyle(.plain)
                         .background(Theme.amberGradient, in: RoundedRectangle(cornerRadius: 10))
                         .foregroundStyle(.white)
-                        Button {
-                            guard importingKey == nil else { return }
-                            importingKey = artifact.key
-                            Task {
-                                let message = await RuleImport.attemptImport(
-                                    client: client, listURL: artifact.url, ruleName: rule.displayName)
-                                onToast(message)
-                                importingKey = nil
+                        if RuleImport.supportsImport(client: client) {
+                            Button {
+                                guard importingKey == nil else { return }
+                                importingKey = artifact.key
+                                Task {
+                                    let message = await RuleImport.attemptImport(
+                                        client: client, listURL: artifact.url, ruleName: rule.displayName)
+                                    onToast(message)
+                                    importingKey = nil
+                                }
+                            } label: {
+                                if importingKey == artifact.key {
+                                    ProgressView()
+                                        .frame(minWidth: 52, minHeight: 34)
+                                } else {
+                                    Text("导入")
+                                        .font(.subheadline.weight(.semibold))
+                                        .frame(minWidth: 52, minHeight: 34)
+                                }
                             }
-                        } label: {
-                            if importingKey == artifact.key {
-                                ProgressView()
-                                    .frame(minWidth: 52, minHeight: 34)
-                            } else {
-                                Text("导入")
-                                    .font(.subheadline.weight(.semibold))
-                                    .frame(minWidth: 52, minHeight: 34)
-                            }
+                            .buttonStyle(.plain)
+                            .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+                            .foregroundStyle(Theme.accent)
                         }
-                        .buttonStyle(.plain)
-                        .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
-                        .foregroundStyle(Theme.accent)
                     }
                     .padding(12)
                     .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                     .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.cardStroke, lineWidth: 1))
                     .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
                 }
-            }
-            if !RuleImport.supportsImport(client: client) {
-                Text("当前客户端暂不支持一键导入，点击将复制规则链接，请在 \(client) 内手动添加。")
-                    .font(.caption)
-                    .foregroundStyle(Theme.secondary)
             }
         }
     }
