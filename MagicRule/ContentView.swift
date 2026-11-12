@@ -486,6 +486,13 @@ struct ClientRulesView: View {
             // 懒加载：点进二级页时才在后台解码该客户端的完整规则列表。
             await store.ensureRulesLoaded(for: client)
             recomputeResults()
+            // 后台预热该客户端的规则图标：rules(for:) 已是默认排序，排前面的就是
+            // 可见行，先下；再往后下。下好的进磁盘缓存，下次打开直接显示。
+            // 低优先级后台任务，不堵界面；失败的行跳过，不影响列表。
+            let iconURLs = store.rules(for: client).compactMap { $0.iconURL }
+            Task.detached(priority: .background) {
+                await RuleIconLoader.shared.prewarm(urls: iconURLs)
+            }
         }
         .onChange(of: allRules) { _, _ in recomputeResults() }
         .onChange(of: sort) { _, _ in recomputeResults() }
