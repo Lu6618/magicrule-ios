@@ -94,25 +94,32 @@ enum RuleSort: String, CaseIterable, Identifiable {
     }
 
     func sort(_ rules: [MagicRule]) -> [MagicRule] {
+        // 每个规则只解析一次日期、只 lowercased 一次名字（build 17）：
+        // 原来的比较器每次比较都调 updatedDate（ISO 解析）和 lowercased()，
+        // 排 1,185 条约 12,000 次比较就是 2 万多次重复解析，全在主线程上。
+        // 这里用 Schwartzian 变换先算好 key 再排，比较器只比现成的值。
         switch self {
         case .updated:
-            return rules.sorted {
-                switch ($0.updatedDate, $1.updatedDate) {
-                case let (a?, b?): return a > b
+            let keyed: [(MagicRule, Date?, String)] = rules.map { ($0, $0.updatedDate, $0.name.lowercased()) }
+            return keyed.sorted { a, b in
+                switch (a.1, b.1) {
+                case let (x?, y?): return x > y
                 case (_?, nil): return true
                 case (nil, _?): return false
-                default: return $0.name.lowercased() < $1.name.lowercased()
+                default: return a.2 < b.2
                 }
-            }
+            }.map { $0.0 }
         case .name:
-            return rules.sorted { $0.name.lowercased() < $1.name.lowercased() }
+            let keyed: [(MagicRule, String)] = rules.map { ($0, $0.name.lowercased()) }
+            return keyed.sorted { $0.1 < $1.1 }.map { $0.0 }
         case .lines:
             return rules.sorted { $0.totalLineCount > $1.totalLineCount }
         case .types:
-            return rules.sorted {
-                if $0.types.count != $1.types.count { return $0.types.count > $1.types.count }
-                return $0.name.lowercased() < $1.name.lowercased()
-            }
+            let keyed: [(MagicRule, Int, String)] = rules.map { ($0, $0.types.count, $0.name.lowercased()) }
+            return keyed.sorted {
+                if $0.1 != $1.1 { return $0.1 > $1.1 }
+                return $0.2 < $1.2
+            }.map { $0.0 }
         }
     }
 }
@@ -389,16 +396,46 @@ struct ClientRulesView: View {
     @State private var sort: RuleSort = .updated
     @FocusState private var searchFocused: Bool
 
+    /// 缓存的展示列表（build 17）：body 求值时直接读，不再每次现算 search + sort。
+    /// 只在规则就绪、搜索词（防抖后）变化、排序方式变化时才重新算。
+    @State private var results: [MagicRule] = []
+    /// results 是否已算出第一版（未算出前显示加载态，不闪“没有找到相关规则”）。
+    @State private var resultsReady = false
+    /// 防抖后的搜索词（打字停 200ms 后才更新，避免每敲一字就全量过滤+排序）。
+    @State private var debouncedQuery = ""
+    /// 搜索防抖代际（只有最新一次按键的防抖任务能更新 debouncedQuery）。
+    @State private var queryGeneration = 0
+    /// 结果计算代际（只有最新一次计算任务能发布结果，防止旧任务后完成盖掉新结果）。
+    @State private var computeGeneration = 0
+
     private var allRules: [MagicRule] {
         store.rules(for: client)
     }
 
-    private var results: [MagicRule] {
-        sort.sort(store.search(query, scope: client))
-    }
-
-    private var distinctTypeCount: Int {
-        Set(allRules.flatMap { $0.types }).count
+    /// 重新算展示列表。快路径（无搜索 + 默认排序）直接用 Store 里预排好的数组，零计算；
+    /// 其余情况（改排序 / 有搜索词）在后台算，算完回主线程发布，代际防旧任务覆盖。
+    private func recomputeResults() {
+        computeGeneration += 1
+        let gen = computeGeneration
+        let q = debouncedQuery
+        let s = sort
+        // 快路径：无搜索 + 默认排序 → Store 里的规则已在加载时按默认排好，直接用。
+        if q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && s == .updated {
+            results = store.rules(for: client)
+            resultsReady = true
+            return
+        }
+        let pool = store.rules(for: client)
+        // 主线程 Task 里 await 后台 detached 计算（只捕获值类型的 pool/q/s），
+        // 算完回到主线程再赋值，@State 写入始终在主线程。
+        Task {
+            let filtered = await Task.detached(priority: .userInitiated) {
+                MagicRuleStore.filteredSortedRules(pool, query: q, sort: s)
+            }.value
+            guard gen == computeGeneration else { return }
+            results = filtered
+            resultsReady = true
+        }
     }
 
     var body: some View {
@@ -425,6 +462,20 @@ struct ClientRulesView: View {
         .task {
             // 懒加载：点进二级页时才在后台解码该客户端的完整规则列表。
             await store.ensureRulesLoaded(for: client)
+            recomputeResults()
+        }
+        .onChange(of: allRules) { _, _ in recomputeResults() }
+        .onChange(of: sort) { _, _ in recomputeResults() }
+        .onChange(of: debouncedQuery) { _, _ in recomputeResults() }
+        .onChange(of: query) { _, newValue in
+            // 搜索防抖 200ms：停 200ms 没新输入才更新 debouncedQuery、触发重算。
+            queryGeneration += 1
+            let gen = queryGeneration
+            Task {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard gen == queryGeneration else { return }
+                debouncedQuery = newValue
+            }
         }
     }
 
@@ -453,7 +504,7 @@ struct ClientRulesView: View {
     private var statCards: some View {
         HStack(spacing: 12) {
             StatCard(value: CountFormat.plain(store.summary(for: client)?.ruleCount ?? allRules.count), label: "规则", accent: false)
-            StatCard(value: store.isClientLoaded(client) ? "\(distinctTypeCount)" : "…", label: "规则类型", accent: true)
+            StatCard(value: store.isClientLoaded(client) ? "\(store.distinctTypeCount(for: client))" : "…", label: "规则类型", accent: true)
             StatCard(value: RelativeFormat.string(from: store.generatedAt(for: client)), label: "最近更新", accent: false)
         }
         .padding(.horizontal, 20)
@@ -527,6 +578,18 @@ struct ClientRulesView: View {
 
             if !store.isClientLoaded(client) && allRules.isEmpty {
                 // 懒加载中：完整规则还在后台解码，先显示加载态，不堵界面。
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text("正在加载规则…")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 48)
+            } else if !resultsReady {
+                // 规则已在内存里，但展示列表还没算出第一版（极短），先显示加载态，
+                // 不闪“没有找到相关规则”。
                 VStack(spacing: 12) {
                     ProgressView()
                         .controlSize(.large)

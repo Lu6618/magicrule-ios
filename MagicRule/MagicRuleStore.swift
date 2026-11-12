@@ -22,6 +22,13 @@ import Network
 /// - 预加载与懒加载共享同一份在途解码任务（inFlightLoads），
 ///   同一客户端只解一次：用户在预加载完成前点进去，等正在解的任务完成即可。
 /// - Worker 刷新成功时会覆盖为最新数据，预加载的结果不会盖住它。
+///
+/// 性能设计（build 17，解决“启动页已加载、点客户端仍卡”）：
+/// - 规则在后台解码时就按默认排序（更新时间倒序）排好存进 rulesByClient，
+///   二级页点进去（无搜索 + 默认排序）直接用这份已排好的数组，零计算。
+/// - 类型数在加载完成时算一次缓存（typeCountByClient），body 里直接读。
+/// - 搜索/排序结果由二级页缓存（@State），只在规则就绪、搜索词（防抖后）
+///   变化、排序方式变化时重算；非默认情况在后台算、算完回主线程发布。
 @MainActor
 final class MagicRuleStore: ObservableObject {
     enum Source: Equatable {
@@ -49,6 +56,9 @@ final class MagicRuleStore: ObservableObject {
     @Published private(set) var loadedClients: Set<String> = []
     /// 正在后台解码完整规则的客户端（二级页显示加载中）。
     @Published private(set) var loadingClients: Set<String> = []
+    /// 各客户端去重后的规则类型数（二级页统计卡用）。规则加载完成时算一次存起来，
+    /// body 里直接读，不再每次现算 flatMap + Set。
+    @Published private(set) var typeCountByClient: [String: Int] = [:]
     /// 启动进度（启动动画用）：0→1，跟真实加载挂钩。
     /// 摘要就绪 0.1；之后每完成一个客户端的完整规则加载 +0.9/11；加载失败也计入，不会卡住。
     @Published private(set) var launchProgress: Double = 0
@@ -92,8 +102,15 @@ final class MagicRuleStore: ObservableObject {
         summaries[client]
     }
 
+    /// 完整规则列表（按客户端懒加载）。注意：每份列表在后台解码时已按默认排序
+    /// （更新时间倒序）排好，二级页无搜索 + 默认排序时直接用，不用再排。
     func rules(for client: String) -> [MagicRule] {
         rulesByClient[client] ?? []
+    }
+
+    /// 某客户端去重后的规则类型数（已缓存；未加载时返回 0）。
+    func distinctTypeCount(for client: String) -> Int {
+        typeCountByClient[client] ?? 0
     }
 
     /// 该客户端的完整规则是否已加载进内存。
@@ -222,6 +239,7 @@ final class MagicRuleStore: ObservableObject {
         loadingClients.remove(client)
         guard !loadedClients.contains(client), let index else { return }
         rulesByClient[client] = index.rules
+        typeCountByClient[client] = Self.distinctTypeCount(of: index.rules)
         let date = MagicRule.date(from: index.generatedAt)
         summaries[client] = ClientSummary(
             client: client,
@@ -289,7 +307,9 @@ final class MagicRuleStore: ObservableObject {
             var result: [(String, ClientIndex)] = []
             for (client, data) in fetchedData {
                 guard let index = Self.decodeIndex(from: data) else { continue }
-                result.append((client, index))
+                // 后台按默认排序排好再发布（build 17），二级页点进去直接用，不用再排。
+                let sorted = ClientIndex(client: index.client, generatedAt: index.generatedAt, rules: RuleSort.updated.sort(index.rules))
+                result.append((client, sorted))
                 if let encoded = try? JSONEncoder().encode(index) {
                     Self.saveCacheData(client: client, data: encoded)
                 }
@@ -300,6 +320,7 @@ final class MagicRuleStore: ObservableObject {
         // 3. 回主线程发布。
         for (client, index) in decoded {
             rulesByClient[client] = index.rules
+            typeCountByClient[client] = Self.distinctTypeCount(of: index.rules)
             let date = MagicRule.date(from: index.generatedAt)
             summaries[client] = ClientSummary(
                 client: client,
@@ -331,6 +352,28 @@ final class MagicRuleStore: ObservableObject {
                 || (rule.chineseName?.lowercased().contains(q) ?? false)
                 || rule.displayName.lowercased().contains(q)
         }
+    }
+
+    /// 某规则列表去重后的类型数（纯计算，可在后台调用）。
+    nonisolated static func distinctTypeCount(of rules: [MagicRule]) -> Int {
+        Set(rules.flatMap { $0.types }).count
+    }
+
+    /// 后台过滤 + 排序（二级页搜索 / 换排序时用）：在后台线程算，算完回主线程发布。
+    /// query 为空且排序为默认时调用方直接用预排好的数组，不走这里。
+    nonisolated static func filteredSortedRules(_ rules: [MagicRule], query: String, sort: RuleSort) -> [MagicRule] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let pool: [MagicRule]
+        if q.isEmpty {
+            pool = rules
+        } else {
+            pool = rules.filter { rule in
+                rule.name.lowercased().contains(q)
+                    || (rule.chineseName?.lowercased().contains(q) ?? false)
+                    || rule.displayName.lowercased().contains(q)
+            }
+        }
+        return sort.sort(pool)
     }
 
     // MARK: - 后台解码（非隔离静态方法，不碰主线程）
@@ -403,17 +446,20 @@ final class MagicRuleStore: ObservableObject {
     }
 
     /// 后台：读某客户端的完整索引。优先缓存（版本有效时），否则内置。
+    /// 解码后立即按默认排序（更新时间倒序）排好再返回（build 17）：
+    /// 二级页点进去（无搜索 + 默认排序）直接用这份已排好的数组，不用在主线程上现排。
     nonisolated static func loadFullIndex(for client: String) -> ClientIndex? {
         if cacheVersionIsValid(),
            let data = try? Data(contentsOf: cacheURL(for: client)),
            let index = decodeIndex(from: data) {
-            return index
+            return ClientIndex(client: index.client, generatedAt: index.generatedAt, rules: RuleSort.updated.sort(index.rules))
         }
         guard let url = Bundle.main.url(forResource: client, withExtension: "json"),
               let data = try? Data(contentsOf: url) else {
             return nil
         }
-        return decodeIndex(from: data)
+        guard let index = decodeIndex(from: data) else { return nil }
+        return ClientIndex(client: index.client, generatedAt: index.generatedAt, rules: RuleSort.updated.sort(index.rules))
     }
 
     // MARK: - 文件缓存（静态方法，可在后台线程调用）
