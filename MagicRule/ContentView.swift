@@ -186,22 +186,39 @@ enum RuleImport {
         return rule.providers.compactMap { URL(string: $0) }.first
     }
 
+    /// 拉取 manifest.json，解析出全部订阅文件（artifacts），保持 manifest 里的顺序。
+    /// 失败、没有 manifest 或没有 artifacts 时返回空数组（调用方退回单个按钮）。
+    static func fetchArtifacts(for rule: MagicRule) async -> [RuleArtifact] {
+        guard let manifestString = rule.manifest,
+              let manifestURL = URL(string: manifestString) else { return [] }
+        var request = URLRequest(url: manifestURL)
+        request.timeoutInterval = 10
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = json["artifacts"] as? [[String: Any]] else { return [] }
+        return raw.compactMap { item in
+            guard let key = item["key"] as? String,
+                  let label = item["label"] as? String,
+                  let urlString = item["url"] as? String,
+                  let url = URL(string: urlString) else { return nil }
+            return RuleArtifact(
+                key: key,
+                label: label,
+                url: url,
+                ext: item["ext"] as? String,
+                role: item["role"] as? String,
+                recommended: (item["recommended"] as? Bool) ?? false
+            )
+        }
+    }
+
     /// 把一条规则解析成可导入的 .list 地址：
     /// 优先读 manifest.json 的 artifacts（取 ext 为 list 的那条），
     /// 拿不到时退回第一个 raw.githubusercontent.com 的 provider，再拿不到退回第一个 provider。
     static func resolveListURL(for rule: MagicRule) async -> URL? {
-        if let manifestString = rule.manifest,
-           let manifestURL = URL(string: manifestString) {
-            var request = URLRequest(url: manifestURL)
-            request.timeoutInterval = 10
-            if let (data, _) = try? await URLSession.shared.data(for: request),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let artifacts = json["artifacts"] as? [[String: Any]], !artifacts.isEmpty {
-                let pick = artifacts.first(where: { ($0["ext"] as? String) == "list" }) ?? artifacts[0]
-                if let urlString = pick["url"] as? String, let url = URL(string: urlString) {
-                    return url
-                }
-            }
+        let artifacts = await fetchArtifacts(for: rule)
+        if let pick = artifacts.first(where: { ($0.ext ?? "").lowercased() == "list" }) ?? artifacts.first {
+            return pick.url
         }
         for p in rule.providers where p.contains("raw.githubusercontent.com") {
             if let url = URL(string: p) { return url }
@@ -210,6 +227,19 @@ enum RuleImport {
             return url
         }
         return nil
+    }
+
+    /// 用指定的 .list 地址一键导入：返回一句 Toast 文案。
+    /// 对应 App 能打开时直接打开；没装或 Scheme 打不开时复制该地址并提示手动导入。
+    static func attemptImport(client: String, listURL: URL, ruleName: String) async -> String {
+        if let (importURL, appName) = importURL(for: client, listURL: listURL, ruleName: ruleName) {
+            if UIApplication.shared.canOpenURL(importURL) {
+                UIApplication.shared.open(importURL, options: [:], completionHandler: nil)
+                return "正在打开\(appName)导入…"
+            }
+            return Clipboard.copy(listURL.absoluteString) ? "已复制链接，请手动导入" : "复制失败，请重试"
+        }
+        return Clipboard.copy(listURL.absoluteString) ? "已复制链接，请手动导入" : "复制失败，请重试"
     }
 
     /// 一键导入：返回一句 Toast 文案。
@@ -221,14 +251,7 @@ enum RuleImport {
             }
             return "没有可导入的链接"
         }
-        if let (importURL, appName) = importURL(for: client, listURL: listURL, ruleName: rule.displayName) {
-            if UIApplication.shared.canOpenURL(importURL) {
-                UIApplication.shared.open(importURL, options: [:], completionHandler: nil)
-                return "正在打开\(appName)导入…"
-            }
-            return Clipboard.copy(listURL.absoluteString) ? "已复制链接，请手动导入" : "复制失败，请重试"
-        }
-        return Clipboard.copy(listURL.absoluteString) ? "已复制链接，请手动导入" : "复制失败，请重试"
+        return await attemptImport(client: client, listURL: listURL, ruleName: rule.displayName)
     }
 }
 
@@ -849,6 +872,10 @@ struct RuleDetailView: View {
     @State private var isImporting = false
     @State private var isManifestExpanded = false
     @State private var isProvidersExpanded = false
+    /// manifest 里的订阅文件：nil = 还在拉，[] = 拉不到/没有，退回单个按钮。
+    @State private var artifacts: [RuleArtifact]? = nil
+    /// 正在导入的那一行 artifact key（行内加载态）；nil = 没有行在导入。
+    @State private var importingKey: String? = nil
 
     private var manifestURL: URL? {
         guard let m = rule.manifest else { return nil }
@@ -933,49 +960,24 @@ struct RuleDetailView: View {
                     .foregroundStyle(Theme.secondary)
                 }
 
-                // 操作：复制链接 + 一键导入
-                HStack(spacing: 12) {
-                    Button {
-                        if let url = shareURL {
-                            onToast(Clipboard.copy(url.absoluteString) ? "链接已复制" : "复制失败，请重试")
-                        }
-                    } label: {
-                        Label("复制链接", systemImage: "doc.on.doc")
-                            .frame(maxWidth: .infinity, minHeight: 48)
+                // 规则订阅：按 manifest 里的 artifacts 分行，每行复制 + 导入。
+                // 还在拉 manifest 时显示加载态；拉不到或没有 artifacts 时，
+                // 退回单个“复制链接 + 一键导入”按钮（不要空白、不要报错）。
+                if let artifacts {
+                    if artifacts.isEmpty {
+                        singleActionButtons
+                    } else {
+                        subscriptionList(artifacts)
                     }
-                    .buttonStyle(.plain)
-                    .background(Theme.amberGradient, in: RoundedRectangle(cornerRadius: 14))
-                    .foregroundStyle(.white)
-                    .font(.body.weight(.semibold))
-                    .disabled(shareURL == nil)
-
-                    Button {
-                        guard !isImporting else { return }
-                        isImporting = true
-                        Task {
-                            let message = await RuleImport.attemptImport(client: client, rule: rule)
-                            onToast(message)
-                            isImporting = false
-                        }
-                    } label: {
-                        if isImporting {
-                            ProgressView()
-                                .frame(maxWidth: .infinity, minHeight: 48)
-                        } else {
-                            Label("一键导入", systemImage: "square.and.arrow.down")
-                                .frame(maxWidth: .infinity, minHeight: 48)
-                        }
+                } else {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("正在加载订阅文件…")
+                            .font(.subheadline)
+                            .foregroundStyle(Theme.secondary)
                     }
-                    .buttonStyle(.plain)
-                    .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 14))
-                    .foregroundStyle(Theme.accent)
-                    .font(.body.weight(.semibold))
-                    .disabled(shareURL == nil)
-                }
-                if !RuleImport.supportsImport(client: client) {
-                    Text("当前客户端暂不支持一键导入，点击将复制规则链接，请在 \(client) 内手动添加。")
-                        .font(.caption)
-                        .foregroundStyle(Theme.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
                 }
 
                 // manifest（默认收起，点一下展开）
@@ -1005,6 +1007,129 @@ struct RuleDetailView: View {
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle(rule.displayName)
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            // 详情页打开时拉 manifest，解析 artifacts；只拉一次。
+            if artifacts == nil {
+                artifacts = await RuleImport.fetchArtifacts(for: rule)
+            }
+        }
+    }
+
+    /// 单个“复制链接 + 一键导入”按钮（兜底：manifest 拉不到或没有 artifacts 时用）。
+    private var singleActionButtons: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Button {
+                    if let url = shareURL {
+                        onToast(Clipboard.copy(url.absoluteString) ? "链接已复制" : "复制失败，请重试")
+                    }
+                } label: {
+                    Label("复制链接", systemImage: "doc.on.doc")
+                        .frame(maxWidth: .infinity, minHeight: 48)
+                }
+                .buttonStyle(.plain)
+                .background(Theme.amberGradient, in: RoundedRectangle(cornerRadius: 14))
+                .foregroundStyle(.white)
+                .font(.body.weight(.semibold))
+                .disabled(shareURL == nil)
+
+                Button {
+                    guard !isImporting else { return }
+                    isImporting = true
+                    Task {
+                        let message = await RuleImport.attemptImport(client: client, rule: rule)
+                        onToast(message)
+                        isImporting = false
+                    }
+                } label: {
+                    if isImporting {
+                        ProgressView()
+                            .frame(maxWidth: .infinity, minHeight: 48)
+                    } else {
+                        Label("一键导入", systemImage: "square.and.arrow.down")
+                            .frame(maxWidth: .infinity, minHeight: 48)
+                    }
+                }
+                .buttonStyle(.plain)
+                .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 14))
+                .foregroundStyle(Theme.accent)
+                .font(.body.weight(.semibold))
+                .disabled(shareURL == nil)
+            }
+            if !RuleImport.supportsImport(client: client) {
+                Text("当前客户端暂不支持一键导入，点击将复制规则链接，请在 \(client) 内手动添加。")
+                    .font(.caption)
+                    .foregroundStyle(Theme.secondary)
+            }
+        }
+    }
+
+    /// 规则订阅列表：每行一个 artifact，左边是 label（推荐的加“推荐”标签），
+    /// 右边是“复制”和“导入”两个小按钮，各管各的文件。
+    private func subscriptionList(_ artifacts: [RuleArtifact]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("规则订阅")
+            VStack(spacing: 10) {
+                ForEach(artifacts) { artifact in
+                    HStack(spacing: 10) {
+                        Text(artifact.label)
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(Theme.text)
+                            .lineLimit(1)
+                        if artifact.recommended {
+                            Text("推荐")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Theme.accentSoft, in: Capsule())
+                                .foregroundStyle(Theme.accent)
+                        }
+                        Spacer()
+                        Button {
+                            onToast(Clipboard.copy(artifact.url.absoluteString) ? "链接已复制" : "复制失败，请重试")
+                        } label: {
+                            Text("复制")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(minWidth: 52, minHeight: 34)
+                        }
+                        .buttonStyle(.plain)
+                        .background(Theme.amberGradient, in: RoundedRectangle(cornerRadius: 10))
+                        .foregroundStyle(.white)
+                        Button {
+                            guard importingKey == nil else { return }
+                            importingKey = artifact.key
+                            Task {
+                                let message = await RuleImport.attemptImport(
+                                    client: client, listURL: artifact.url, ruleName: rule.displayName)
+                                onToast(message)
+                                importingKey = nil
+                            }
+                        } label: {
+                            if importingKey == artifact.key {
+                                ProgressView()
+                                    .frame(minWidth: 52, minHeight: 34)
+                            } else {
+                                Text("导入")
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(minWidth: 52, minHeight: 34)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+                        .foregroundStyle(Theme.accent)
+                    }
+                    .padding(12)
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.cardStroke, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
+                }
+            }
+            if !RuleImport.supportsImport(client: client) {
+                Text("当前客户端暂不支持一键导入，点击将复制规则链接，请在 \(client) 内手动添加。")
+                    .font(.caption)
+                    .foregroundStyle(Theme.secondary)
+            }
+        }
     }
 }
 

@@ -57,6 +57,20 @@ struct MagicRule: Identifiable, Codable, Hashable {
     }
 }
 
+/// manifest.json 里的一个订阅文件（artifact）。
+/// 比如 Telegram/Loon 的 manifest 有 3 个：完整规则、DOMAIN-SET、RULE-SET。
+/// 字段来自 manifest.json 的 artifacts 数组；`ext` 用于挑 .list 文件导入。
+struct RuleArtifact: Identifiable, Hashable {
+    let key: String
+    let label: String
+    let url: URL
+    let ext: String?
+    let role: String?
+    let recommended: Bool
+
+    var id: String { key }
+}
+
 /// 单个客户端的索引文件：`{client, generated_at, rules: [...]}`。
 struct ClientIndex: Codable {
     let client: String
