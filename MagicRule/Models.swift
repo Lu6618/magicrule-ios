@@ -1,7 +1,12 @@
 import Foundation
 
 /// MagicRule 索引里的一条规则。
-/// JSON 字段为 snake_case，用 convertFromSnakeCase 解码。
+/// JSON 字段为 snake_case，用 convertFromSnakeCase 解码，
+/// 但 icon_url 是个例外：convertFromSnakeCase 把它转成 iconUrl，
+/// 跟属性名 iconURL（大写 URL）对不上，可选类型又让它静默变 nil，
+/// 结果全部规则的图标都出不来。下面的 CodingKeys 显式映射 iconURL，
+/// 注意：自定义 CodingKeys 会绕过 convertFromSnakeCase，
+/// 所以 11 个属性必须全部列出，值写 JSON 里的原字段名。
 struct MagicRule: Identifiable, Codable, Hashable {
     let id: String
     let name: String
@@ -14,6 +19,20 @@ struct MagicRule: Identifiable, Codable, Hashable {
     let totalLineCount: Int
     let manifest: String?
     let providers: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case chineseName = "chinese_name"
+        case iconURL = "icon_url"
+        case description
+        case types
+        case ruleUpdatedAt = "rule_updated_at"
+        case typeCounts = "type_counts"
+        case totalLineCount = "total_line_count"
+        case manifest
+        case providers
+    }
 
     /// 显示名：有中文名显示中文名，否则显示英文名。
     var displayName: String {
