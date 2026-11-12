@@ -76,9 +76,15 @@ final class MagicRuleStore: ObservableObject {
     private let monitorQueue = DispatchQueue(label: "magicrule.network")
     private var hasRefreshed = false
 
+    /// 解码器：用默认 key 策略（useDefaultKeys），不做任何转换。
+    /// MagicRule / ClientIndex 都写了显式 CodingKeys，raw 值就是 JSON 里的
+    /// snake_case 原字段名，直接原样匹配。千万别再加 .convertFromSnakeCase：
+    /// 它会先把 JSON key 转成 camelCase 再去匹配 CodingKey 的 stringValue，
+    /// 而 stringValue 是 raw 值（如 total_line_count），对不上号，
+    /// 非可选字段一找不到就整个 decode 抛错——build 22 就是这么把
+    /// 规则列表搞灭的（decodeIndex 的 try? 静默吞错返回 nil）。
     private nonisolated static var decoder: JSONDecoder {
         let d = JSONDecoder()
-        d.keyDecodingStrategy = .convertFromSnakeCase
         return d
     }
 

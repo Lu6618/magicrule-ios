@@ -1,12 +1,14 @@
 import Foundation
 
 /// MagicRule 索引里的一条规则。
-/// JSON 字段为 snake_case，用 convertFromSnakeCase 解码，
-/// 但 icon_url 是个例外：convertFromSnakeCase 把它转成 iconUrl，
-/// 跟属性名 iconURL（大写 URL）对不上，可选类型又让它静默变 nil，
-/// 结果全部规则的图标都出不来。下面的 CodingKeys 显式映射 iconURL，
-/// 注意：自定义 CodingKeys 会绕过 convertFromSnakeCase，
-/// 所以 11 个属性必须全部列出，值写 JSON 里的原字段名。
+/// JSON 字段为 snake_case，解码器用默认 key 策略（不做转换），
+/// 靠下面的 CodingKeys 显式映射：raw 值写 JSON 里的原字段名。
+/// 注意：自定义 CodingKeys 的 stringValue 就是 raw 值，解码时直接拿它
+/// 跟 JSON key 原样比对；如果解码器还开着 .convertFromSnakeCase，
+/// JSON key 会先被转成 camelCase（如 total_line_count → totalLineCount），
+/// 再也匹配不上 snake_case 的 raw 值，非可选字段一找不到就整个 decode 抛错
+/// （build 22 的回归就是这么来的）。所以 CodingKeys 和解码器策略必须配套：
+/// CodingKeys 写 snake_case raw 值 ↔ 解码器用默认策略。
 struct MagicRule: Identifiable, Codable, Hashable {
     let id: String
     let name: String
@@ -91,10 +93,18 @@ struct RuleArtifact: Identifiable, Hashable {
 }
 
 /// 单个客户端的索引文件：`{client, generated_at, rules: [...]}`。
+/// 跟 MagicRule 一样用显式 CodingKeys（raw 值为 JSON 原字段名），
+/// 因为解码器是默认 key 策略，不做 snake_case 转换。
 struct ClientIndex: Codable {
     let client: String
     let generatedAt: String?
     let rules: [MagicRule]
+
+    enum CodingKeys: String, CodingKey {
+        case client
+        case generatedAt = "generated_at"
+        case rules
+    }
 }
 
 /// 客户端轻量摘要：首页只需要名字、规则条数、最近更新时间。
